@@ -1,0 +1,422 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Orb Screensaver</title>
+<style>
+  :root { --ui-bg: rgba(10,14,22,.82); --ui-fg: #dfe8f5; --ui-dim: #7d8aa0; --ui-line: rgba(255,255,255,.08); --ui-accent: #4aa8ff; }
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  body { font: 13px/1.4 "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif; color: var(--ui-fg); }
+  body.idle, body.idle * { cursor: none !important; }
+  canvas { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; background: #000; }
+
+  #clock { position: fixed; left: 50%; top: 50%; transform: translate(-50%,-50%); pointer-events: none;
+    font: 200 clamp(48px, 9vh, 140px)/1 "Segoe UI Variable Display", "Segoe UI", system-ui, sans-serif;
+    letter-spacing: .04em; color: #fff; opacity: .85; text-shadow: 0 0 30px rgba(0,0,0,.35); display: none; white-space: nowrap; }
+  #clock small { display: block; text-align: center; font-size: .2em; letter-spacing: .3em; opacity: .7; margin-top: .6em; font-weight: 400; }
+
+  #hint { position: fixed; left: 50%; bottom: 32px; transform: translateX(-50%); color: var(--ui-dim);
+    font-size: 12px; letter-spacing: .05em; transition: opacity 1s; pointer-events: none; }
+  #hint kbd { color: var(--ui-fg); border: 1px solid var(--ui-line); border-radius: 4px; padding: 1px 6px; font: inherit; }
+
+  #gear { position: fixed; top: 16px; right: 16px; width: 36px; height: 36px; border-radius: 10px; border: 1px solid var(--ui-line);
+    background: var(--ui-bg); color: var(--ui-fg); font-size: 18px; cursor: pointer; transition: opacity .4s; }
+  body.idle #gear { opacity: 0; pointer-events: none; }
+
+  #panel { position: fixed; top: 16px; right: 16px; bottom: 16px; width: 290px; overflow-y: auto; padding: 16px 18px;
+    background: var(--ui-bg); backdrop-filter: blur(14px); border: 1px solid var(--ui-line); border-radius: 14px;
+    transform: translateX(calc(100% + 40px)); transition: transform .35s cubic-bezier(.2,.8,.2,1); scrollbar-width: thin; }
+  #panel.open { transform: none; }
+  #panel h2 { margin: 0 0 4px; font-size: 15px; font-weight: 600; display: flex; justify-content: space-between; align-items: center; }
+  #panel h3 { margin: 18px 0 8px; font-size: 11px; font-weight: 600; letter-spacing: .12em; text-transform: uppercase; color: var(--ui-dim); }
+  #panel .close { background: none; border: 0; color: var(--ui-dim); font-size: 18px; cursor: pointer; }
+  .row { display: grid; grid-template-columns: 1fr auto; gap: 2px 10px; margin: 8px 0; align-items: center; }
+  .row label { color: var(--ui-fg); }
+  .row output { color: var(--ui-dim); font-variant-numeric: tabular-nums; font-size: 12px; }
+  .row input[type=range] { grid-column: 1 / -1; width: 100%; accent-color: var(--ui-accent); margin: 0; }
+  .presets { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+  .presets button { border: 1px solid var(--ui-line); border-radius: 8px; padding: 6px 4px 5px; background: rgba(255,255,255,.03);
+    color: var(--ui-fg); font: inherit; font-size: 11px; cursor: pointer; }
+  .presets button.on { border-color: var(--ui-accent); }
+  .presets i { display: block; height: 14px; border-radius: 4px; margin-bottom: 4px; }
+  .colors { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; text-align: center; font-size: 11px; color: var(--ui-dim); }
+  .colors input { width: 100%; height: 30px; border: 1px solid var(--ui-line); border-radius: 8px; background: none; padding: 2px; cursor: pointer; }
+  .check { display: flex; align-items: center; gap: 8px; margin: 8px 0; cursor: pointer; }
+  .check input { accent-color: var(--ui-accent); }
+  select { background: rgba(255,255,255,.05); color: var(--ui-fg); border: 1px solid var(--ui-line); border-radius: 6px; padding: 3px 6px; font: inherit; }
+  select option { background: #111; }
+  .btns { display: flex; gap: 8px; margin-top: 18px; }
+  .btns button { flex: 1; border: 1px solid var(--ui-line); background: rgba(255,255,255,.04); color: var(--ui-fg); border-radius: 8px; padding: 7px; font: inherit; cursor: pointer; }
+  .btns button:hover, .presets button:hover { background: rgba(255,255,255,.08); }
+  .stat { color: var(--ui-dim); font-size: 11px; margin-top: 12px; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="clock"></div>
+<div id="hint"><kbd>H</kbd> settings &nbsp;·&nbsp; <kbd>F</kbd> / <kbd>F11</kbd> fullscreen &nbsp;·&nbsp; <kbd>Space</kbd> pause</div>
+<button id="gear" title="Settings (H)">⚙</button>
+
+<aside id="panel">
+  <h2>Orb <button class="close" id="closeBtn" title="Close (H)">×</button></h2>
+
+  <h3>Palette</h3>
+  <div class="presets" id="presets"></div>
+  <div class="colors" style="margin-top:10px">
+    <div><input type="color" data-k="c0">Deep</div>
+    <div><input type="color" data-k="c1">Mid</div>
+    <div><input type="color" data-k="c2">Light</div>
+    <div><input type="color" data-k="c3">Accent</div>
+  </div>
+
+  <h3>Shape &amp; motion</h3>
+  <div id="sliders1"></div>
+
+  <h3>Look</h3>
+  <div id="sliders2"></div>
+
+  <h3>Screen &amp; performance</h3>
+  <label class="check"><input type="checkbox" data-k="drift"> Anti burn‑in drift</label>
+  <label class="check"><input type="checkbox" data-k="clock"> Show clock</label>
+  <div id="sliders3"></div>
+  <div class="row"><label>FPS cap</label>
+    <select data-k="fps"><option value="24">24</option><option value="30">30</option><option value="60">60</option><option value="0">Unlimited</option></select>
+  </div>
+
+  <div class="btns"><button id="fsBtn">Fullscreen</button><button id="resetBtn">Reset</button></div>
+  <div class="stat" id="stat"></div>
+</aside>
+
+<script>
+(() => {
+  const PRESETS = {
+    "Hub Blue": ["#01081a", "#1b7bd4", "#aee8ff", "#4b3cff"],
+    "Aurora":   ["#00150f", "#13b98b", "#caffea", "#7a3cff"],
+    "Ember":    ["#160400", "#e0531c", "#ffd59e", "#ff2a6a"],
+    "Violet":   ["#0b0220", "#7b3cff", "#e2ccff", "#ff3ca8"],
+    "Toxic":    ["#031200", "#74d11a", "#f1ffb5", "#00c8ff"],
+    "Mono":     ["#040404", "#7d8590", "#ffffff", "#5a78ff"],
+  };
+  const DEFAULTS = {
+    c0: PRESETS["Hub Blue"][0], c1: PRESETS["Hub Blue"][1], c2: PRESETS["Hub Blue"][2], c3: PRESETS["Hub Blue"][3],
+    size: 0.82, speed: 1, detail: 7, warp: 0.4, wobble: 0.5, breathe: 0.3,
+    grain: 0.45, glow: 0.6, accent: 0.55, brightness: 1.0, contrast: 0.7,
+    scale: 1, fps: 60, drift: true, clock: false,
+  };
+  const SLIDERS = {
+    sliders1: [
+      ["size", "Size", 0.2, 1.4, 0.01],
+      ["speed", "Speed", 0, 3, 0.01],
+      ["detail", "Pattern detail", 2, 20, 0.1],
+      ["warp", "Turbulence", 0, 1.2, 0.01],
+      ["wobble", "Edge wobble", 0, 2, 0.01],
+      ["breathe", "Breathing", 0, 1.5, 0.01],
+    ],
+    sliders2: [
+      ["grain", "Particle grain", 0, 1, 0.01],
+      ["glow", "Outer glow", 0, 2, 0.01],
+      ["accent", "Accent tint", 0, 1, 0.01],
+      ["brightness", "Brightness", 0.3, 2, 0.01],
+      ["contrast", "Contrast", 0, 1.5, 0.01],
+    ],
+    sliders3: [
+      ["scale", "Render resolution", 0.35, 1, 0.05, v => Math.round(v * 100) + "%"],
+    ],
+  };
+
+  // ---------- settings ----------
+  let S = { ...DEFAULTS };
+  try { Object.assign(S, JSON.parse(localStorage.getItem("orb-settings") || "{}")); } catch (e) {}
+  const save = () => { try { localStorage.setItem("orb-settings", JSON.stringify(S)); } catch (e) {} };
+
+  // ---------- WebGL ----------
+  const canvas = document.getElementById("c");
+  const gl = canvas.getContext("webgl", { antialias: false, alpha: false, powerPreference: "low-power", preserveDrawingBuffer: false });
+  if (!gl) { document.body.innerHTML = "<p style='color:#fff;padding:2em'>WebGL is not available in this browser.</p>"; return; }
+
+  const VS = `attribute vec2 a; void main(){ gl_Position = vec4(a, 0.0, 1.0); }`;
+  const FS = `
+precision highp float;
+uniform vec2  uRes;
+uniform float uTime;
+uniform vec2  uOff;
+uniform float uSize, uDetail, uWarp, uWobble, uGrain, uGlow, uAccent, uBright, uContrast;
+uniform vec3  uC0, uC1, uC2, uC3;
+
+float hash(vec3 p){
+  p = fract(p * vec3(.1031, .1030, .0973));
+  p += dot(p, p.yxz + 33.33);
+  return fract((p.x + p.y) * p.z);
+}
+float noise(vec3 x){
+  vec3 i = floor(x), f = fract(x);
+  f = f * f * (3.0 - 2.0 * f);
+  return mix(mix(mix(hash(i), hash(i + vec3(1,0,0)), f.x),
+                 mix(hash(i + vec3(0,1,0)), hash(i + vec3(1,1,0)), f.x), f.y),
+             mix(mix(hash(i + vec3(0,0,1)), hash(i + vec3(1,0,1)), f.x),
+                 mix(hash(i + vec3(0,1,1)), hash(i + vec3(1,1,1)), f.x), f.y), f.z);
+}
+vec2 rot(vec2 v, float a){ float c = cos(a), s = sin(a); return mat2(c, s, -s, c) * v; }
+
+vec3 pal(float x){
+  x = clamp(x, 0.0, 1.0);
+  vec3 c = mix(uC0, uC1, smoothstep(0.0, 0.55, x));
+  return mix(c, uC2, smoothstep(0.5, 1.0, x));
+}
+
+void main(){
+  vec2 p = (gl_FragCoord.xy - 0.5 * uRes) / uRes.y - uOff;
+  float t = uTime;
+  float R = 0.5 * uSize;
+
+  // living, slightly irregular silhouette
+  float ang = atan(p.y, p.x);
+  vec3 ap = vec3(cos(ang), sin(ang), 0.0) * 1.6;
+  float wob = 1.0 + uWobble * 0.035 * (noise(ap + vec3(0.0, 0.0, t * 0.35)) * 2.0 - 1.0);
+  float Rw = R * wob;
+  float r = length(p) / Rw;
+
+  vec3 col = vec3(0.0);
+
+  if (r < 1.0) {
+    // point on the sphere surface
+    vec3 n = vec3(p / Rw, sqrt(max(1.0 - r * r, 0.0)));
+    vec3 q = n;
+    q.xz = rot(q.xz, t * 0.11);
+    q.yz = rot(q.yz, t * 0.07);
+
+    // organic domain warp
+    vec3 wv = vec3(noise(q * 1.8 + vec3(0.0, 0.0,  t * 0.25)),
+                   noise(q * 1.8 + vec3(17.0, 3.0, -t * 0.21)),
+                   noise(q * 1.8 + vec3(5.0, 31.0,  t * 0.18))) - 0.5;
+    vec3 w = normalize(q + wv * uWarp);
+
+    // interference of travelling waves from 4 wandering sources (cymatics-like lobes)
+    float f = 0.0;
+    for (int i = 0; i < 4; i++) {
+      float fi = float(i);
+      vec3 s = normalize(vec3(sin(t * (0.13 + 0.05 * fi) + fi * 1.7),
+                              cos(t * (0.11 + 0.04 * fi) + fi * 2.3),
+                              sin(t * (0.09 + 0.03 * fi) + fi * 0.9)));
+      float g = acos(clamp(dot(w, s), -1.0, 1.0));
+      f += cos(g * uDetail - t * (1.1 + 0.2 * fi) + fi);
+    }
+    f *= 0.25;
+    float band  = 0.5 + 0.5 * f;
+    float ridge = pow(1.0 - abs(f), 3.0);
+    float I = 0.45 * band + 0.6 * ridge;
+    I = mix(0.6, I, uContrast);
+
+    // soft lighting + rim
+    vec3 L = normalize(vec3(-0.25, 0.35, 0.9));
+    float lit = 0.55 + 0.5 * max(dot(n, L), 0.0);
+    float rim = pow(1.0 - n.z, 2.5);
+    I = I * lit + rim * (0.2 + 0.55 * ridge);
+
+    // particle stipple, anchored to the rotating surface
+    float cells = uRes.y * Rw * 0.55;
+    float st = mix(hash(floor(q * cells)), hash(floor(q * cells * 0.5) + 7.0), 0.35);
+    I *= mix(1.0, 0.2 + 1.6 * st, uGrain);
+
+    I *= uBright;
+
+    // fuzzy edge
+    float en = noise(ap * 2.0 + vec3(0.0, 0.0, t * 0.4 + 9.0));
+    float edge = smoothstep(1.0, 0.78 - 0.14 * en, r);
+
+    vec3 c = pal(I) * (0.15 + 0.95 * I);
+
+    // accent tint creeping in from the lower-right rim
+    float aw = smoothstep(0.1, 1.0, dot(normalize(p + 1e-5), vec2(0.8, -0.6))) * (0.25 + rim);
+    c = mix(c, uC3 * (0.25 + 0.9 * I), clamp(aw * uAccent * 1.3, 0.0, 1.0));
+
+    col = c * edge;
+  }
+
+  // outer halo
+  float d = max(r - 1.0, 0.0);
+  float halo = uGlow * (0.22 * exp(-d * 9.0) + 0.07 * exp(-d * 2.5)) * smoothstep(0.82, 1.0, r);
+  halo = max(halo - 0.003, 0.0);  // keep the far background true black
+  col += mix(uC1, uC3, 0.35 * uAccent) * halo;
+
+  // gentle tonemap, then dither (only where there is light, so AMOLED black stays off)
+  col = 1.0 - exp(-col * 1.6);
+  float lum = max(col.r, max(col.g, col.b));
+  col += (hash(vec3(gl_FragCoord.xy, fract(t) * 97.0)) - 0.5) / 255.0 * step(1.5 / 255.0, lum);
+
+  gl_FragColor = vec4(col, 1.0);
+}`;
+
+  function shader(type, src) {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+    return s;
+  }
+  const prog = gl.createProgram();
+  gl.attachShader(prog, shader(gl.VERTEX_SHADER, VS));
+  gl.attachShader(prog, shader(gl.FRAGMENT_SHADER, FS));
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+  gl.useProgram(prog);
+
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+  const aLoc = gl.getAttribLocation(prog, "a");
+  gl.enableVertexAttribArray(aLoc);
+  gl.vertexAttribPointer(aLoc, 2, gl.FLOAT, false, 0, 0);
+
+  const U = {};
+  ["uRes","uTime","uOff","uSize","uDetail","uWarp","uWobble","uGrain","uGlow","uAccent","uBright","uContrast","uC0","uC1","uC2","uC3"]
+    .forEach(n => U[n] = gl.getUniformLocation(prog, n));
+
+  const hex = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16) / 255);
+
+  function resize() {
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const w = Math.max(1, Math.floor(innerWidth * dpr * S.scale));
+    const h = Math.max(1, Math.floor(innerHeight * dpr * S.scale));
+    if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+    gl.viewport(0, 0, w, h);
+  }
+  addEventListener("resize", resize);
+
+  // ---------- loop ----------
+  const clockEl = document.getElementById("clock");
+  const statEl = document.getElementById("stat");
+  let simT = 0, last = performance.now(), lastDraw = 0, paused = false;
+  let frames = 0, fpsT = performance.now();
+
+  function frame(now) {
+    requestAnimationFrame(frame);
+    const cap = +S.fps;
+    if (cap > 0 && now - lastDraw < 1000 / cap - 1.5) return;
+    lastDraw = now;
+
+    const dt = Math.min((now - last) / 1000, 0.1);
+    last = now;
+    if (!paused) simT += dt * S.speed;
+
+    const real = now / 1000;
+    const off = S.drift ? [Math.sin(real * 0.021) * 0.07, Math.sin(real * 0.029 + 1.3) * 0.05] : [0, 0];
+    const size = S.size * (1 + S.breathe * 0.035 * Math.sin(simT * 0.55));
+
+    resize();
+    gl.uniform2f(U.uRes, canvas.width, canvas.height);
+    gl.uniform1f(U.uTime, simT);
+    gl.uniform2f(U.uOff, off[0], off[1]);
+    gl.uniform1f(U.uSize, size);
+    gl.uniform1f(U.uDetail, S.detail);
+    gl.uniform1f(U.uWarp, S.warp);
+    gl.uniform1f(U.uWobble, S.wobble);
+    gl.uniform1f(U.uGrain, S.grain);
+    gl.uniform1f(U.uGlow, S.glow);
+    gl.uniform1f(U.uAccent, S.accent);
+    gl.uniform1f(U.uBright, S.brightness);
+    gl.uniform1f(U.uContrast, S.contrast);
+    gl.uniform3fv(U.uC0, hex(S.c0));
+    gl.uniform3fv(U.uC1, hex(S.c1));
+    gl.uniform3fv(U.uC2, hex(S.c2));
+    gl.uniform3fv(U.uC3, hex(S.c3));
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+    if (S.clock) {
+      const d = new Date();
+      const hm = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+      const day = d.toLocaleDateString([], { weekday: "long", day: "numeric", month: "long" }).toUpperCase();
+      const html = hm + "<small>" + day + "</small>";
+      if (clockEl.innerHTML !== html) clockEl.innerHTML = html;
+      clockEl.style.transform = `translate(calc(-50% + ${off[0] * innerHeight}px), calc(-50% - ${off[1] * innerHeight}px))`;
+    }
+
+    frames++;
+    if (now - fpsT > 1000) {
+      statEl.textContent = `${frames} fps · ${canvas.width}×${canvas.height} px`;
+      frames = 0; fpsT = now;
+    }
+  }
+
+  // ---------- UI ----------
+  const panel = document.getElementById("panel");
+  const presetsEl = document.getElementById("presets");
+
+  for (const [name, cols] of Object.entries(PRESETS)) {
+    const b = document.createElement("button");
+    b.innerHTML = `<i style="background:linear-gradient(90deg,${cols[0]},${cols[1]},${cols[2]},${cols[3]})"></i>${name}`;
+    b.onclick = () => { [S.c0, S.c1, S.c2, S.c3] = cols; sync(); save(); };
+    b.dataset.preset = name;
+    presetsEl.appendChild(b);
+  }
+
+  for (const [host, list] of Object.entries(SLIDERS)) {
+    const el = document.getElementById(host);
+    for (const [k, label, min, max, step, fmt] of list) {
+      const row = document.createElement("div");
+      row.className = "row";
+      row.innerHTML = `<label>${label}</label><output></output><input type="range" min="${min}" max="${max}" step="${step}" data-k="${k}">`;
+      row.querySelector("input")._fmt = fmt || (v => (+v).toFixed(2));
+      el.appendChild(row);
+    }
+  }
+
+  const inputs = [...panel.querySelectorAll("[data-k]")];
+  function sync() {
+    for (const inp of inputs) {
+      const k = inp.dataset.k;
+      if (inp.type === "checkbox") inp.checked = !!S[k];
+      else inp.value = S[k];
+      if (inp.type === "range") inp.previousElementSibling.textContent = inp._fmt(S[k]);
+    }
+    for (const b of presetsEl.children) {
+      const c = PRESETS[b.dataset.preset];
+      b.classList.toggle("on", c.join() === [S.c0, S.c1, S.c2, S.c3].join());
+    }
+    clockEl.style.display = S.clock ? "block" : "none";
+  }
+  for (const inp of inputs) {
+    inp.addEventListener("input", () => {
+      const k = inp.dataset.k;
+      S[k] = inp.type === "checkbox" ? inp.checked : inp.type === "range" || inp.tagName === "SELECT" ? +inp.value : inp.value;
+      sync(); save();
+    });
+  }
+
+  const togglePanel = force => panel.classList.toggle("open", force);
+  const toggleFS = () => document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen().catch(() => {});
+  document.getElementById("gear").onclick = () => togglePanel(true);
+  document.getElementById("closeBtn").onclick = () => togglePanel(false);
+  document.getElementById("fsBtn").onclick = toggleFS;
+  document.getElementById("resetBtn").onclick = () => { S = { ...DEFAULTS }; sync(); save(); };
+  canvas.addEventListener("dblclick", toggleFS);
+  canvas.addEventListener("click", () => togglePanel(false));
+
+  addEventListener("keydown", e => {
+    if (e.target.tagName === "INPUT" && e.target.type !== "range" && e.target.type !== "checkbox") return;
+    const k = e.key.toLowerCase();
+    if (k === "h") togglePanel();
+    else if (k === "f") toggleFS();
+    else if (k === " ") { paused = !paused; e.preventDefault(); }
+    else if (k === "escape") togglePanel(false);
+  });
+
+  // hide cursor + gear when idle
+  let idleTimer;
+  const wake = () => {
+    document.body.classList.remove("idle");
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => { if (!panel.classList.contains("open")) document.body.classList.add("idle"); }, 2500);
+  };
+  addEventListener("mousemove", wake);
+  wake();
+
+  const hint = document.getElementById("hint");
+  setTimeout(() => hint.style.opacity = 0, 5000);
+
+  sync();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

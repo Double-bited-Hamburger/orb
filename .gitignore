@@ -1,0 +1,7 @@
+# build output (Orb.exe is published as a release asset, not committed)
+native/build/
+native/*.exe
+*.o
+
+# test harness output
+native/tools/out/
