@@ -51,7 +51,7 @@ if ([W5]::GetAncestor([W5]::WindowFromPoint($pt), 2) -ne $h) {
     Stop-Process $p; Remove-Item Env:ORB_INI
     throw "$Name : another window is covering Orb, screenshot not taken"
 }
-if ($Settings) { $x = $scr.X; $y = $scr.Y; $w = $scr.Width; $hh = $scr.Height } else { $x = $r.L; $y = $r.T; $w = $r.R - $r.L; $hh = $r.B - $r.T }
+$x = $r.L; $y = $r.T; $w = $r.R - $r.L; $hh = $r.B - $r.T   # the settings panel is drawn inside the window
 $bmp = New-Object System.Drawing.Bitmap $w, $hh
 [System.Drawing.Graphics]::FromImage($bmp).CopyFromScreen($x, $y, 0, 0, $bmp.Size)
 $out = Join-Path $dir "$Name.png"

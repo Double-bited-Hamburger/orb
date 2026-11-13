@@ -3,7 +3,7 @@
 An animated, glowing particle orb with a **liquid-glass clock**, made for a second monitor.
 It renders on a **true-black background**, so on an OLED/AMOLED screen everything that isn't lit stays off.
 
-Native Windows app, a single ~340 KB `.exe` with nothing to install (Win32 + Direct3D 11).
+Native Windows app, a single ~380 KB `.exe` with nothing to install (Win32 + Direct3D 11 + Direct2D).
 
 ![Orb with the liquid-glass clock](docs/orb_glass.png)
 
@@ -14,6 +14,8 @@ Native Windows app, a single ~340 KB `.exe` with nothing to install (Win32 + Dir
 
 ![Nebula, Ember palette](docs/nebula_ember.png)
 
+![The settings panel](docs/panel.png)
+
 ## Download
 
 Get **`Orb.exe`** from the [latest release](../../releases/latest), put it anywhere and run it.
@@ -23,10 +25,15 @@ Windows SmartScreen may ask for confirmation the first time: choose *More info �
 ## Features
 
 - **7 forms**: Orb, Blob, Ring, Cube and Crystal are raymarched 3D shapes that **morph** smoothly into each other. Aurora and Nebula are full-screen effects. Auto-morph cycles through the 3D forms by itself.
-- **Liquid-glass clock**: a frosted panel that refracts and bends what's behind it, with a chromatic rim, sheen and shadow. Choose Glass, Minimal (text only) or Off. 7 positions, 12/24-hour time, optional seconds and date, adjustable size, frost and refraction.
+- **Realistic Aurora**: folding, patchy curtains with soft rays over snowy mountains and a pine tree line, mirrored in a rippling lake.
+- **Liquid-glass clock**: a frosted panel that refracts and bends what's behind it, with a chromatic rim, sheen and shadow, and it pulses with the bass. Choose Glass, Minimal (text only) or Off. 7 positions, 12/24-hour time, optional seconds and date, adjustable size, frost and refraction.
+- **Battery and now playing**: the clock can show the battery level and charging state, plus the title and artist of what's playing (any app that uses Windows media controls, such as Spotify or a browser).
+- **Animated settings panel**: a dark liquid-glass sheet slides in from the right, with eased sliders, toggles, a segmented control, form icons and gradient palette swatches.
+- **Bloom and drifting sparks** around the 3D forms.
 - **Reacts to sound**: it listens to whatever the PC is playing (music, videos), and the orb pulses with the bass and ripples faster with the volume. Auto-gain plus a sensitivity slider. Nothing is recorded.
 - **Looks**: 6 palette presets plus 4 custom colours, color cycling, twinkling stars, particle grain, glow, contrast and more.
 - **Screen-friendly**: anti burn-in drift slowly moves the orb and clock. Pure-black background. FPS cap and render resolution for lighter use.
+- **Anti-aliasing**: 1.5× or 2× supersampling for smooth edges and grain.
 - Remembers its settings, its monitor and whether it was fullscreen.
 
 ## Controls

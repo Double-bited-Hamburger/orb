@@ -10,6 +10,6 @@ type nul > build\empty.c
 gcc -c build\empty.c -o build\default-manifest.o || exit /b 1
 windres orb.rc -O coff -o build\orb_res.o || exit /b 1
 g++ -Bbuild\ -O2 -std=c++17 -mwindows -static -s -fno-exceptions -fno-rtti orb.cpp build\orb_res.o -o "%OUT%" ^
-    -ld3d11 -ldxgi -lole32 -lgdi32 -luser32 -lcomctl32 -lcomdlg32 -ldwmapi -lwinmm || exit /b 1
+    -ld3d11 -ldxgi -ld2d1 -ldwrite -lole32 -lgdi32 -luser32 -lcomdlg32 -ldwmapi -lwinmm || exit /b 1
 rmdir /s /q build
 echo Built %~dp0%OUT%

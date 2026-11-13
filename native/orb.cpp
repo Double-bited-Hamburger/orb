@@ -1,5 +1,5 @@
 // Orb — animated shader orb on a true-black background, with a liquid-glass clock.
-// Native Win32 + Direct3D 11, single file, no dependencies beyond Windows itself.
+// Native Win32 + Direct3D 11 (+ Direct2D/DirectWrite for the settings panel). Single file.
 //
 // Keys:  H / right-click = settings      F / F11 / Alt+Enter / double-click = fullscreen
 //        1-7 = form   M = auto-morph   C = clock style   A = react to sound
@@ -20,14 +20,16 @@
 #include <windows.h>
 #include <mmsystem.h>
 #include <mmreg.h>
-#include <commctrl.h>
 #include <commdlg.h>
 #include <dwmapi.h>
 #include <timeapi.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
+#include <d2d1_1.h>
+#include <dwrite.h>
 #include <mmdeviceapi.h>
 #include <audioclient.h>
+#include <winstring.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -40,10 +42,11 @@
 #ifdef _MSC_VER
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "d2d1.lib")
+#pragma comment(lib, "dwrite.lib")
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "ole32.lib")
-#pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "winmm.lib")
@@ -59,16 +62,23 @@ cbuffer Orb : register(b0) {
   float uWobble; float uGrain; float uGlow; float uAccent;
   float uBright; float uContrast; float uStars; float uMorph;
   int uFormA; int uFormB; float uBass; float uLevel;
+  float uParticles; float uCharge; float uSS; float _pad0;   // uSS = scene pixels per screen pixel
   float4 uC0, uC1, uC2, uC3;
 };
 cbuffer Comp : register(b1) {
-  float4 gPanel;   // centre xy, half-size xy (px)
+  float4 gPanel;   // clock panel centre xy, half-size xy (px)
   float4 gGlass;   // corner radius, frost radius (px), refraction, style (0 off, 1 minimal, 2 glass)
   float4 gText;    // text box xy, wh (px)
   float4 gMisc;    // backbuffer w, h, text alpha, px scale (h / 1440)
+  float4 gAudio;   // bass, level, bloom strength, settings-panel opacity
+  float4 gUi;      // settings panel rect x, y, w, h (px)
+  float4 gUi2;     // settings panel corner radius, frost radius
 };
+cbuffer Post : register(b2) { float4 pTexel; float4 pParam; };
 Texture2D sceneTex : register(t0);
 Texture2D textTex  : register(t1);
+Texture2D bloomTex : register(t2);
+Texture2D uiTex    : register(t3);
 SamplerState smp   : register(s0);
 
 struct VO { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
@@ -168,7 +178,6 @@ float4 orb3D(float2 p, int fa, int fb, float m) {
   float3 ro = float3(0.0, 0.0, 4.0);
   float3 rd = normalize(float3(uv * 0.258, -1.0));
 
-  // only march inside a bounding sphere; elsewhere estimate the distance for the halo
   float b = dot(ro, rd), h = b * b - (dot(ro, ro) - 4.84);   // bounding radius 2.2
   float dmin = length(cross(ro, rd)) - 1.0;
   bool hit = false;
@@ -219,9 +228,23 @@ float4 orb3D(float2 p, int fa, int fb, float m) {
     float rim = pow(max(1.0 - ndv, 0.0), 2.5);
     I = I * lit + rim * (0.2 + 0.55 * ridge);
 
-    float cells = uRes.y * R * 0.55;
-    float st = lerp(hash(floor(q * cells)), hash(floor(q * cells * 0.5) + 7.0), 0.35);
-    I *= lerp(1.0, 0.2 + 1.6 * st, uGrain);
+    // particle stipple: soft round grains (~3 screen px) scattered in 3D cells and anchored to the surface,
+    // instead of hard square pixels
+    // two layers on different, rotated lattices with random gaps, so no grid pattern shows
+    float cells = uRes.y / uSS * R * 0.38;
+    float dotv = 0.0;
+    [unroll] for (int l = 0; l < 2; l++) {
+      float3 cq = (l == 0 ? q : float3(0.8 * q.x - 0.6 * q.z, 0.6 * q.x * 0.48 + 0.8 * q.y + 0.36 * q.z, 0.36 * q.x - 0.6 * q.y + 0.71 * q.z))
+                  * cells * (l == 0 ? 1.0 : 1.37);
+      float3 ci = floor(cq) + l * 31.7;
+      float3 jit = float3(hash(ci), hash(ci + 11.1), hash(ci + 27.3)) - 0.5;
+      float hr = hash(ci + 5.7);
+      float rad = 0.22 + 0.16 * hash(ci + 19.3);
+      float dd = length(frac(cq) - 0.5 - jit * 0.5);
+      dotv = max(dotv, smoothstep(rad, rad * 0.25, dd) * step(0.35, hr) * (0.4 + 0.6 * hr) * (l == 0 ? 1.0 : 0.8));
+    }
+    float st = lerp(dotv, noise(q * cells * 0.45), 0.35);
+    I *= lerp(1.0, 0.25 + 1.45 * st, uGrain);
     I *= uBright * (1.0 + 0.35 * uLevel);
 
     float en = noise(dir * 2.0 + float3(0.0, 0.0, t * 0.4 + 9.0));
@@ -235,40 +258,133 @@ float4 orb3D(float2 p, int fa, int fb, float m) {
   }
 
   float hd = max(dmin, 0.0);
-  float halo = uGlow * (1.0 + uBass * 1.5) * (0.22 * exp(-hd * 9.0) + 0.07 * exp(-hd * 2.5)) * (1.0 - cov);
+  float halo = uGlow * (1.0 + uBass * 1.5 + 0.6 * uCharge) * (0.22 * exp(-hd * 9.0) + 0.07 * exp(-hd * 2.5)) * (1.0 - cov);
   halo = max(halo - 0.003, 0.0);
   col += lerp(uC1.rgb, uC3.rgb, 0.35 * uAccent) * halo;
   return float4(col, max(cov, saturate(halo * 4.0)));
 }
 
+// sparks that peel off the surface and drift away
+float3 embers(float2 p) {
+  float R = 0.5 * uSize;
+  float3 c = 0;
+  [loop] for (int i = 0; i < 48; i++) {
+    float fi = (float)i;
+    float h1 = hash(float3(fi, 1.3, 7.1)), h2 = hash(float3(fi, 4.7, 2.2)), h3 = hash(float3(fi, 9.1, 5.5));
+    float life = 5.0 + 7.0 * h3;
+    float tt = frac(uTime / life + h1);
+    float ang = h2 * 6.2831853 + tt * (h1 - 0.5) * 1.2;
+    float r = R * (0.92 + tt * (0.5 + 0.9 * h1));
+    float2 pos = float2(cos(ang), sin(ang)) * r + float2(0.0, tt * 0.04);
+    float sz = R * (0.006 + 0.010 * h3);
+    float2 d = p - pos;
+    float fade = sin(tt * 3.14159);
+    fade *= fade;
+    c += exp(-dot(d, d) / (sz * sz)) * fade * (0.5 + 0.5 * h2);
+  }
+  return c * lerp(uC2.rgb, uC3.rgb, 0.35) * uParticles * (1.0 + uLevel);
+}
+
 // ------------------------------------------------ 2D forms
 float grain2D(float2 fc, float speed) {
-  float2 g = floor((fc + float2(uTime * speed, 0.0)) / max(1.0, uRes.y / 700.0));
+  float2 g = floor((fc + float2(uTime * speed, 0.0)) / (max(1.0, uRes.y / uSS / 700.0) * uSS));
   return lerp(1.0, 0.35 + 1.3 * hash(float3(g, 3.7)), uGrain * 0.7);
 }
 
-float4 aurora(float2 p, float2 fc) {
-  float t = uTime, S = uSize;
-  float3 col = 0;
-  [unroll] for (int k = 0; k < 3; k++) {
-    float fk = (float)k;
-    float x = p.x / S * (1.0 + 0.25 * fk) + t * 0.04 * (1.0 + 0.5 * fk) + fk * 3.1;
-    float y = (-0.20 + 0.11 * fk) * S
-            + S * (0.10 * sin(x * 2.3 + t * 0.21) + 0.05 * sin(x * 5.1 - t * 0.33 + fk)
-                   + 0.2 * uWarp * (noise(float3(x * 1.7, fk * 5.0, t * 0.12)) - 0.5));
-    float dy = (p.y - y) / S;
-    float rays = 0.45 + 0.55 * noise(float3(x * uDetail * 2.2, dy * 1.2 - t * 0.5, fk * 11.0));
-    float body = exp(-max(dy, 0.0) * (4.6 + fk * 1.5)) * smoothstep(-0.03, 0.0, dy)
-               * smoothstep(0.75, 0.15, dy);                         // let the sky above go back to black
-    float I = body * rays * (1.0 - 0.18 * fk) * (1.0 + uBass * 0.8);
-    I = lerp(I * 0.6 + 0.12 * body, I, uContrast);
-    I *= grain2D(fc, 14.0) * uBright * (1.0 + 0.35 * uLevel);
-    float3 c = shade(I);
-    c = lerp(c, uC3.rgb * I, saturate(dy * 1.6) * uAccent);
-    col += c * (1.0 - 0.25 * fk);
+// mountain ridge height (screen units) at x
+float ridge(float x) {
+  // ridged noise: sharp peaks and valleys instead of soft hills
+  float h = 0.0, a = 0.55, f = 1.1;
+  [unroll] for (int i = 0; i < 6; i++) {
+    float n = 1.0 - abs(2.0 * noise(float3(x * f, 3.7, 1.3 * i)) - 1.0);
+    h += a * n * n;
+    f *= 2.15; a *= 0.45;
   }
-  float lum = max(col.r, max(col.g, col.b));
-  return float4(col, saturate(lum * 3.0));
+  return -0.37 + 0.22 * h;
+}
+
+// near shore: low rolling hills with a pine tree line on top
+float shore(float x) {
+  float h = -0.392 + 0.022 * noise(float3(x * 2.2, 8.1, 0.0)) + 0.012 * noise(float3(x * 6.0, 2.2, 0.0));
+  float cw = 0.0055, cx = x / cw, id = floor(cx), fx = frac(cx) - 0.5;
+  float th = hash(float3(id, 4.4, 1.0));
+  float forest = smoothstep(0.35, 0.6, noise(float3(x * 1.7, 5.5, 0.0)));   // forest patches and clearings
+  float tall = (0.010 + 0.026 * th) * forest * step(0.2, th);
+  float sway = fx - 0.12 * (hash(float3(id, 2.0, 9.0)) - 0.5);
+  return h + tall * max(1.0 - abs(sway) * 2.4, 0.0);
+}
+
+// night landscape: aurora curtains, a far range catching their light, a dark tree line in front
+float3 auroraSky(float2 p, out float a) {
+  a = 0.0;
+  float e = 1.2 / uRes.y;                                // one pixel: analytic anti-aliasing of silhouettes
+  float cS = smoothstep(-e, e, p.y - shore(p.x));
+  if (cS <= 0.0) { a = 1.0; return 0; }                 // tree line: pure black
+  float rg = ridge(p.x);
+  float cR = smoothstep(-e, e, p.y - rg);
+  float t = uTime;
+  float3 tint = lerp(uC1.rgb, uC2.rgb, 0.25);
+  // far range: almost black, the upper slopes (snow) catch a little aurora light
+  float3 mtn = tint * (0.010 + 0.07 * exp(-max(rg - p.y, 0.0) / 0.022))
+             * (0.55 + 0.45 * noise(float3(p.x * 45.0, p.y * 70.0, 1.0))) * uBright * (1.0 - cR);
+  // faint airglow low on the horizon
+  float3 col = lerp(uC1.rgb, uC3.rgb, 0.3) * 0.04 * exp(-(p.y + 0.30) / 0.10) * uBright;
+  [loop] for (int k = 0; k < 3; k++) {
+    float fk = (float)k;
+    float x = p.x * (0.85 + 0.25 * fk) + fk * 7.3;
+    // big slow folds + small ripples that run along the curtain
+    float fold = 0.085 * sin(x * 1.6 + t * 0.06 + fk) + 0.045 * sin(x * 3.7 - t * 0.10 + fk * 2.0)
+               + 0.11 * uWarp * (noise(float3(x * 1.1, fk * 4.0, t * 0.05)) - 0.5)
+               + 0.010 * sin(x * 13.0 - t * 1.1 + fk * 3.0) * (0.5 + 0.5 * sin(x * 1.3 + t * 0.2));
+    // where the curtain folds towards us we look along it: brighter and denser
+    float slope = 0.136 * cos(x * 1.6 + t * 0.06 + fk) + 0.166 * cos(x * 3.7 - t * 0.10 + fk * 2.0);
+    float edgeOn = 0.55 + 0.9 / (1.0 + 30.0 * slope * slope);
+    // the curtain is patchy: some stretches glow, others almost vanish
+    float patch = smoothstep(0.2, 0.8, noise(float3(x * 0.55 + 3.0, fk * 5.0, t * 0.025)));
+    float base = (-0.21 + 0.11 * fk) * (0.6 + 0.5 * uSize) + fold;
+    float dy = p.y - base;
+    if (dy < -0.03) continue;
+    float hy = max(dy, 0.0);
+    // soft rays that follow the folds and slowly drift; some reach much higher than others
+    float xr = (x + fold * 2.0) * uDetail * 4.0 + t * 0.05;
+    float r1 = noise(float3(xr, hy * 0.8 - t * 0.15, fk * 9.0));
+    float r2 = noise(float3(xr * 2.7 + 5.0, hy * 0.5, t * 0.25 + fk));
+    float rays = 0.32 + 0.68 * smoothstep(0.2, 0.9, r1) * (0.6 + 0.4 * r2);
+    float len = 0.14 + 0.26 * noise(float3(xr * 0.3, fk * 2.0, t * 0.04));
+    float edge = smoothstep(-0.016, 0.002, dy);                         // sharp lower edge
+    float prof = edge * (0.75 * exp(-hy / 0.05) + 0.45 * exp(-hy / (len * (1.0 - 0.15 * fk))));
+    float flick = 0.75 + 0.25 * noise(float3(x * 2.4, t * 0.55, fk * 3.0));
+    float I = prof * rays * flick * edgeOn * (0.15 + 0.85 * patch) * (1.0 - 0.22 * fk) * (1.0 + uBass * 0.8);
+    I = pow(max(I, 0.0), 0.6 + 0.6 * uContrast) * uBright * (1.0 + 0.35 * uLevel);
+    // colour by altitude: Mid low down, Accent high up, Light in the hot core, a thin Accent fringe at the bottom
+    float hgt = saturate(hy / 0.42);
+    float3 c = lerp(uC1.rgb, uC3.rgb, smoothstep(0.10, 0.80, hgt) * (0.35 + 0.65 * uAccent));
+    c = lerp(c, uC2.rgb, saturate(I * 1.3 - 0.45) * (1.0 - hgt));
+    float fringe = smoothstep(-0.02, -0.005, dy) * (1.0 - smoothstep(-0.004, 0.008, dy));
+    c = lerp(c, uC3.rgb, fringe * 0.55 * uAccent);
+    col += c * I * 1.25;
+  }
+  col *= cR;
+  a = max(1.0 - cR, saturate(max(col.r, max(col.g, col.b)) * 3.0));
+  return (col + mtn) * cS;
+}
+
+float4 aurora(float2 p, float2 fc) {
+  const float water = -0.40;                         // still lake in front of the mountains
+  float2 q = p;
+  float k = 1.0;
+  if (p.y < water) {
+    // mirrored sky, stretched (the lake is seen at a grazing angle) and broken up by slow ripples
+    float d = water - p.y;
+    float rip = sin(d * 260.0 - uTime * 1.1 + 2.0 * noise(float3(p.x * 9.0, d * 30.0, uTime * 0.2)));
+    q = float2(p.x + 0.004 * rip * (0.3 + d * 6.0), water + 0.03 + d * 2.6);
+    k = 0.42 * exp(-d * 3.0) * (0.85 + 0.15 * rip);
+  }
+  float a;
+  float3 col = auroraSky(q, a) * k;
+  col *= lerp(1.0, grain2D(fc, 10.0), 0.25);
+  float wl = smoothstep(-1.2 / uRes.y, 1.2 / uRes.y, water - p.y);    // anti-aliased waterline
+  return float4(col, lerp(a, 1.0, wl));
 }
 
 float4 nebula(float2 p, float2 fc) {
@@ -277,19 +393,20 @@ float4 nebula(float2 p, float2 fc) {
   float3 q = float3(u * 0.9, t * 0.05);
   float2 w = float2(fbm(q + float3(0.0, 0.0, t * 0.03)), fbm(q + float3(5.2, 1.3, -t * 0.02)));
   float f = fbm(q + uWarp * 2.2 * float3(w, 0.0) + float3(0.0, 0.0, t * 0.04));
-  float ridge = pow(max(1.0 - abs(sin(f * uDetail * 1.4 - t * 0.6)), 0.0), 3.0);
-  float I = f * (0.7 + 0.8 * ridge);
+  float rdg = pow(max(1.0 - abs(sin(f * uDetail * 1.4 - t * 0.6)), 0.0), 3.0);
+  float I = f * (0.7 + 0.8 * rdg);
   I = lerp(0.55 * f + 0.2, I, uContrast);
+  // dark dust lanes winding through the glowing gas
+  float dust = smoothstep(0.42, 0.72, fbm(q * 2.4 + float3(w * 1.6, 7.0)));
+  I *= 1.0 - 0.7 * dust;
   float mask = exp(-dot(u, u) * 0.85) * (1.0 + uBass * 0.6);
   I = max(I * mask * 1.7 - 0.06, 0.0);
   I *= grain2D(fc, 6.0) * uBright * (1.0 + 0.35 * uLevel);
   float3 c = shade(I);
   float aw = smoothstep(0.0, 1.0, dot(normalize(u + 1e-5), float2(0.8, -0.6))) * smoothstep(0.3, 1.4, length(u));
   c = lerp(c, uC3.rgb * (0.2 + I), saturate(aw * uAccent));
-  float halo = uGlow * 0.10 * mask;
-  c += lerp(uC1.rgb, uC3.rgb, 0.4) * halo * (1.0 - saturate(I));
-  float lum = max(c.r, max(c.g, c.b));
-  return float4(c, saturate(lum * 3.0));
+  c += lerp(uC1.rgb, uC3.rgb, 0.4) * uGlow * 0.10 * mask * (1.0 - saturate(I));
+  return float4(c, saturate(max(c.r, max(c.g, c.b)) * 3.0));
 }
 
 float3 stars(float2 fc) {
@@ -331,6 +448,7 @@ float4 psScene(VO i) : SV_Target {
   if (wA > 0.001) r += wA * aurora(p, fc);
   if (wN > 0.001) r += wN * nebula(p, fc);
   float3 col = r.rgb + stars(fc) * (1.0 - saturate(r.a));
+  if (w3 > 0.001 && uParticles > 0.001) col += w3 * embers(p);
 
   col = 1.0 - exp(-col * 1.6);
   float lum = max(col.r, max(col.g, col.b));
@@ -338,16 +456,74 @@ float4 psScene(VO i) : SV_Target {
   return float4(col, 1.0);
 }
 
-// ------------------------------------------------ composite: upscale + liquid-glass clock
+// ------------------------------------------------ bloom
+float4 psBright(VO i) : SV_Target {
+  float2 t = pTexel.xy;
+  float3 c = (sceneTex.SampleLevel(smp, i.uv + t * float2(-1, -1), 0).rgb + sceneTex.SampleLevel(smp, i.uv + t * float2(1, -1), 0).rgb +
+              sceneTex.SampleLevel(smp, i.uv + t * float2(-1, 1), 0).rgb + sceneTex.SampleLevel(smp, i.uv + t * float2(1, 1), 0).rgb) * 0.25;
+  float l = max(c.r, max(c.g, c.b));
+  float k = saturate((l - pParam.x) / pParam.y);
+  return float4(c * k * k, 1.0);
+}
+float4 psBlur(VO i) : SV_Target {
+  float2 d = pTexel.xy * pTexel.zw;
+  float3 c = bloomTex.SampleLevel(smp, i.uv, 0).rgb * 0.2270270270;
+  c += (bloomTex.SampleLevel(smp, i.uv + d * 1.3846153846, 0).rgb + bloomTex.SampleLevel(smp, i.uv - d * 1.3846153846, 0).rgb) * 0.3162162162;
+  c += (bloomTex.SampleLevel(smp, i.uv + d * 3.2307692308, 0).rgb + bloomTex.SampleLevel(smp, i.uv - d * 3.2307692308, 0).rgb) * 0.0702702703;
+  return float4(c, 1.0);
+}
+
+// ------------------------------------------------ composite: upscale + bloom + glass clock + settings panel
 float sdRBox(float2 p, float2 b, float r) {
   float2 q = abs(p) - b + r;
   return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
 }
-float3 scene(float2 px) { return sceneTex.SampleLevel(smp, px / gMisc.xy, 0).rgb; }
+float3 scene(float2 px) {
+  float2 uv = px / gMisc.xy;
+  return sceneTex.SampleLevel(smp, uv, 0).rgb + bloomTex.SampleLevel(smp, uv, 0).rgb * gAudio.z;
+}
 float textA(float2 px) {
   float2 uv = (px - gText.xy) / gText.zw;
   if (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0) return 0.0;
   return textTex.SampleLevel(smp, uv, 0).a;
+}
+
+// liquid glass sheet over 'col': refraction at the rim, frosted blur, chromatic edge, sheen, rim light, shadow
+float3 glassOver(float3 col, float2 px, float2 c, float2 hs, float rad, float br, float refrK, float milk, float dark, float pulse) {
+  float k1 = gMisc.w;
+  float d = sdRBox(px - c, hs, rad);
+  float dS = sdRBox(px - c - float2(0.0, min(0.10 * hs.y, 18.0 * k1)), hs, rad);
+  col *= 1.0 - 0.5 * exp(-max(dS, 0.0) / min(0.22 * hs.y, 40.0 * k1)) * smoothstep(-1.0, 1.0, d);
+  if (d >= 1.0) return col;
+
+  float2 g = float2(sdRBox(px + float2(1, 0) - c, hs, rad) - sdRBox(px - float2(1, 0) - c, hs, rad),
+                    sdRBox(px + float2(0, 1) - c, hs, rad) - sdRBox(px - float2(0, 1) - c, hs, rad));
+  g = dot(g, g) > 1e-8 ? normalize(g) : float2(0.0, 0.0);
+  float bw = min(min(hs.x, hs.y) * 0.6, 70.0 * k1);
+  float bev = pow(1.0 - saturate(-d / bw), 2.5);
+  float2 refr = -g * bev * bw * refrK * (1.0 + 0.6 * pulse);
+  float2 ca = g * bev * bw * 0.07 * refrK;
+
+  float3 acc = 0;
+  [loop] for (int k = 0; k < 32; k++) {
+    float fk = (float)k + 0.5;
+    float a = fk * 2.39996;
+    float2 o = px + refr + float2(cos(a), sin(a)) * sqrt(fk / 32.0) * br;
+    acc += float3(scene(o + ca).r, scene(o).g, scene(o - ca).b);
+  }
+  float3 glass = acc / 32.0;
+  float lum = dot(glass, float3(0.299, 0.587, 0.114));
+  glass = max(lerp(lum.xxx, glass, 1.3), 0.0);
+  glass = lerp(glass * 1.1 + milk, glass * 0.40 + 0.012, dark);
+
+  float vy = (px.y - (c.y - hs.y)) / (2.0 * hs.y);
+  glass += 0.07 * (1.0 - 0.5 * dark) * pow(saturate(1.0 - vy), 3.0);
+  float rimLine = exp(-abs(d + 1.3 * k1) / (1.1 * k1));
+  float keyL = saturate(dot(g, normalize(float2(-0.55, -0.85))));
+  float backL = saturate(dot(g, normalize(float2(0.55, 0.85))));
+  glass += rimLine * (0.16 + 0.6 * keyL * keyL + 0.28 * backL * backL) * (1.0 + 1.5 * pulse);
+  glass += (0.05 + 0.12 * pulse) * bev * lerp(float3(1, 1, 1), uC2.rgb, 0.5);
+  return lerp(col, glass, saturate(0.5 - d));
 }
 
 float4 psComp(VO i) : SV_Target {
@@ -356,50 +532,7 @@ float4 psComp(VO i) : SV_Target {
   int style = (int)gGlass.w;
   float k1 = gMisc.w;
 
-  if (style == 2) {
-    float2 c = gPanel.xy, hs = gPanel.zw;
-    float rad = gGlass.x;
-    float d = sdRBox(px - c, hs, rad);
-
-    // soft drop shadow
-    float dS = sdRBox(px - c - float2(0.0, 0.10 * hs.y), hs, rad);
-    col *= 1.0 - 0.5 * exp(-max(dS, 0.0) / (0.22 * hs.y)) * smoothstep(-1.0, 1.0, d);
-
-    if (d < 1.0) {
-      float2 g = float2(sdRBox(px + float2(1, 0) - c, hs, rad) - sdRBox(px - float2(1, 0) - c, hs, rad),
-                        sdRBox(px + float2(0, 1) - c, hs, rad) - sdRBox(px - float2(0, 1) - c, hs, rad));
-      g = dot(g, g) > 1e-8 ? normalize(g) : float2(0.0, 0.0);
-      float bw = min(hs.x, hs.y) * 0.6;              // bevel width
-      float bev = pow(1.0 - saturate(-d / bw), 2.5);  // 1 at the rim -> 0 in the flat middle
-      float2 refr = -g * bev * bw * gGlass.z;          // lens: background is pulled in at the rim
-      float2 ca = g * bev * bw * 0.07 * gGlass.z;     // chromatic split along the rim
-
-      float3 acc = 0;
-      float br = gGlass.y;
-      [loop] for (int k = 0; k < 32; k++) {
-        float fk = (float)k + 0.5;
-        float a = fk * 2.39996;
-        float2 o = px + refr + float2(cos(a), sin(a)) * sqrt(fk / 32.0) * br;
-        acc += float3(scene(o + ca).r, scene(o).g, scene(o - ca).b);
-      }
-      float3 glass = acc / 32.0;
-      float lum = dot(glass, float3(0.299, 0.587, 0.114));
-      glass = max(lerp(lum.xxx, glass, 1.3), 0.0);    // a bit more saturated, like real glass
-      glass = glass * 1.1 + 0.03;                       // faint milky body so it reads on pure black
-
-      float vy = (px.y - (c.y - hs.y)) / (2.0 * hs.y);
-      glass += 0.07 * pow(saturate(1.0 - vy), 3.0);     // sheen from the top
-
-      float rimLine = exp(-abs(d + 1.3 * k1) / (1.1 * k1));
-      float keyL = saturate(dot(g, normalize(float2(-0.55, -0.85))));
-      float backL = saturate(dot(g, normalize(float2(0.55, 0.85))));
-      glass += rimLine * (0.16 + 0.6 * keyL * keyL + 0.28 * backL * backL);
-      glass += 0.05 * bev;                               // glass thickness glow
-
-      col = lerp(col, glass, saturate(0.5 - d));
-    }
-  }
-
+  if (style == 2) col = glassOver(col, px, gPanel.xy, gPanel.zw, gGlass.x, gGlass.y, gGlass.z, 0.03, 0.0, gAudio.x);
   if (style >= 1) {
     float sa = 0.0;
     float2 so = float2(0.0, 2.0 * k1);
@@ -410,6 +543,17 @@ float4 psComp(VO i) : SV_Target {
     sa /= 9.0;
     col *= 1.0 - sa * (style == 2 ? 0.35 : 0.65);
     col = lerp(col, float3(0.97, 0.98, 1.0), textA(px) * gMisc.z);
+  }
+
+  if (gAudio.w > 0.001) {                     // settings panel: dark liquid glass + Direct2D content
+    float2 hs = gUi.zw * 0.5, c = gUi.xy + hs;
+    float3 g = glassOver(col, px, c, hs, gUi2.x, gUi2.y, 0.35, 0.0, 0.62, 0.0);
+    col = lerp(col, g, gAudio.w);
+    float2 uv = (px - gUi.xy) / gUi.zw;
+    if (uv.x >= 0.0 && uv.y >= 0.0 && uv.x <= 1.0 && uv.y <= 1.0) {
+      float4 u = uiTex.SampleLevel(smp, uv, 0);
+      col = col * (1.0 - u.a * gAudio.w) + u.rgb * gAudio.w;
+    }
   }
   return float4(col, 1.0);
 }
@@ -422,9 +566,11 @@ struct OrbCB {
     float bright, contrast, stars, morph;
     int formA, formB;
     float bass, level;
+    float particles, charge, ss, pad0;
     float c[4][4];
 };
-struct CompCB { float panel[4], glass[4], text[4], misc[4]; };
+struct CompCB { float panel[4], glass[4], text[4], misc[4], audio[4], ui[4], ui2[4]; };
+struct PostCB { float texel[4], param[4]; };
 
 // ---------------------------------------------------------------- settings
 enum {
@@ -432,34 +578,38 @@ enum {
     P_GRAIN, P_GLOW, P_ACCENT, P_BRIGHT, P_CONTRAST, P_STARS,
     P_HUE, P_MORPHSEC, P_SCALE,
     P_CLOCKSIZE, P_FROST, P_REFR, P_SENS,
+    P_BLOOM, P_PARTICLES,
     NP
 };
 enum { FMT_F, FMT_PCT, FMT_SEC };
 struct ParamDef { const wchar_t* key; const wchar_t* label; float mn, mx, def; int fmt; };
 static const ParamDef PD[NP] = {
-    {L"size",       L"Size",           0.2f, 1.4f, 0.82f, FMT_F},
-    {L"speed",      L"Speed",          0.0f, 3.0f, 1.00f, FMT_F},
-    {L"detail",     L"Pattern detail", 2.0f, 20.f, 7.00f, FMT_F},
-    {L"warp",       L"Turbulence",     0.0f, 1.2f, 0.40f, FMT_F},
-    {L"wobble",     L"Edge wobble",    0.0f, 2.0f, 0.50f, FMT_F},
-    {L"breathe",    L"Breathing",      0.0f, 1.5f, 0.30f, FMT_F},
-    {L"grain",      L"Particle grain", 0.0f, 1.0f, 0.45f, FMT_F},
-    {L"glow",       L"Outer glow",     0.0f, 2.0f, 0.60f, FMT_F},
-    {L"accent",     L"Accent tint",    0.0f, 1.0f, 0.55f, FMT_F},
-    {L"brightness", L"Brightness",     0.3f, 2.0f, 1.00f, FMT_F},
-    {L"contrast",   L"Contrast",       0.0f, 1.5f, 0.70f, FMT_F},
-    {L"stars",      L"Stars",          0.0f, 1.0f, 0.35f, FMT_F},
-    {L"hue",        L"Color cycle",    0.0f, 1.0f, 0.00f, FMT_F},
-    {L"morphsec",   L"Morph every",    10.f, 180.f, 45.f, FMT_SEC},
-    {L"scale",      L"Render res.",    0.35f, 1.0f, 1.00f, FMT_PCT},
-    {L"clocksize",  L"Clock size",     0.5f, 2.5f, 1.35f, FMT_F},
-    {L"frost",      L"Frost",          0.0f, 1.0f, 0.55f, FMT_F},
-    {L"refraction", L"Refraction",     0.0f, 1.5f, 0.80f, FMT_F},
-    {L"sensitivity",L"Sensitivity",    0.0f, 2.0f, 1.00f, FMT_F},
+    {L"size",       L"Size",              0.2f, 1.4f, 0.82f, FMT_F},
+    {L"speed",      L"Speed",             0.0f, 3.0f, 1.00f, FMT_F},
+    {L"detail",     L"Pattern detail",    2.0f, 20.f, 7.00f, FMT_F},
+    {L"warp",       L"Turbulence",        0.0f, 1.2f, 0.40f, FMT_F},
+    {L"wobble",     L"Edge wobble",       0.0f, 2.0f, 0.50f, FMT_F},
+    {L"breathe",    L"Breathing",         0.0f, 1.5f, 0.30f, FMT_F},
+    {L"grain",      L"Particle grain",    0.0f, 1.0f, 0.45f, FMT_F},
+    {L"glow",       L"Outer glow",        0.0f, 2.0f, 0.60f, FMT_F},
+    {L"accent",     L"Accent tint",       0.0f, 1.0f, 0.55f, FMT_F},
+    {L"brightness", L"Brightness",        0.3f, 2.0f, 1.00f, FMT_F},
+    {L"contrast",   L"Contrast",          0.0f, 1.5f, 0.70f, FMT_F},
+    {L"stars",      L"Stars",             0.0f, 1.0f, 0.35f, FMT_F},
+    {L"hue",        L"Colour cycle",      0.0f, 1.0f, 0.00f, FMT_F},
+    {L"morphsec",   L"Morph every",       10.f, 180.f, 45.f, FMT_SEC},
+    {L"scale",      L"Render resolution", 0.35f, 1.0f, 1.00f, FMT_PCT},
+    {L"clocksize",  L"Clock size",        0.5f, 2.5f, 1.35f, FMT_F},
+    {L"frost",      L"Frost",             0.0f, 1.0f, 0.55f, FMT_F},
+    {L"refraction", L"Refraction",        0.0f, 1.5f, 0.80f, FMT_F},
+    {L"sensitivity",L"Sensitivity",       0.0f, 2.0f, 1.00f, FMT_F},
+    {L"bloom",      L"Bloom",             0.0f, 1.5f, 0.60f, FMT_F},
+    {L"particles",  L"Drifting sparks",   0.0f, 1.0f, 0.50f, FMT_F},
 };
 
 struct Preset { const wchar_t* name; COLORREF c[4]; };
-static const Preset PRESETS[6] = {
+// Palette presets: name + 4 colours {Deep, Mid, Light, Accent}. Add a line to add a preset (max 10).
+static const Preset PRESETS[] = {
     {L"Hub Blue", {RGB(0x01,0x08,0x1a), RGB(0x1b,0x7b,0xd4), RGB(0xae,0xe8,0xff), RGB(0x4b,0x3c,0xff)}},
     {L"Aurora",   {RGB(0x00,0x15,0x0f), RGB(0x13,0xb9,0x8b), RGB(0xca,0xff,0xea), RGB(0x7a,0x3c,0xff)}},
     {L"Ember",    {RGB(0x16,0x04,0x00), RGB(0xe0,0x53,0x1c), RGB(0xff,0xd5,0x9e), RGB(0xff,0x2a,0x6a)}},
@@ -467,6 +617,8 @@ static const Preset PRESETS[6] = {
     {L"Toxic",    {RGB(0x03,0x12,0x00), RGB(0x74,0xd1,0x1a), RGB(0xf1,0xff,0xb5), RGB(0x00,0xc8,0xff)}},
     {L"Mono",     {RGB(0x04,0x04,0x04), RGB(0x7d,0x85,0x90), RGB(0xff,0xff,0xff), RGB(0x5a,0x78,0xff)}},
 };
+static const int NUM_PRESETS = (int)(sizeof(PRESETS) / sizeof(PRESETS[0]));
+static_assert(sizeof(PRESETS) / sizeof(PRESETS[0]) <= 10, "at most 10 palette presets");
 static const wchar_t* COLOR_NAMES[4] = {L"Deep", L"Mid", L"Light", L"Accent"};
 static const wchar_t* FORM_NAMES[7] = {L"Orb", L"Blob", L"Ring", L"Cube", L"Crystal", L"Aurora", L"Nebula"};
 static const wchar_t* CLOCK_STYLES[3] = {L"Off", L"Minimal", L"Glass"};
@@ -477,15 +629,18 @@ enum { NUM_FORMS = 7, NUM_3D = 5 };
 struct Settings {
     float p[NP];
     COLORREF c[4];
-    bool drift, autoMorph, h24, seconds, showDate, audio;
-    int fps, form, clockStyle, clockPos;
+    bool drift, autoMorph, h24, seconds, showDate, audio, showBattery, showMedia;
+    int fps, form, clockStyle, clockPos, aa;   // aa: 0 off, 1 = 1.5x, 2 = 2x supersampling
 };
+static const float AA_FACTOR[3] = {1.f, 1.5f, 2.f};
+static const wchar_t* AA_NAMES[3] = {L"Off", L"1.5× SSAA", L"2× SSAA"};
 static Settings S;
 
 static void defaults() {
     for (int i = 0; i < NP; i++) S.p[i] = PD[i].def;
     for (int i = 0; i < 4; i++) S.c[i] = PRESETS[0].c[i];
     S.drift = true; S.autoMorph = false; S.h24 = true; S.seconds = false; S.showDate = true; S.audio = false;
+    S.showBattery = true; S.showMedia = true; S.aa = 1;
     S.fps = 60; S.form = 0; S.clockStyle = 2; S.clockPos = 0;
 }
 
@@ -534,6 +689,9 @@ static bool loadSettings() {
     S.seconds = iniF(L"orb", L"seconds", 0) != 0;
     S.showDate = iniF(L"orb", L"date", 1) != 0;
     S.audio = iniF(L"orb", L"audio", 0) != 0;
+    S.showBattery = iniF(L"orb", L"battery", 1) != 0;
+    S.showMedia = iniF(L"orb", L"media", 1) != 0;
+    S.aa = clampi((int)iniF(L"orb", L"aa", 1), 0, 2);
     S.fps = (int)iniF(L"orb", L"fps", 60);
     S.form = clampi((int)iniF(L"orb", L"form", 0), 0, NUM_FORMS - 1);
     S.clockStyle = clampi((int)iniF(L"orb", L"clockstyle", 2), 0, 2);
@@ -543,8 +701,7 @@ static bool loadSettings() {
 
 // ---------------------------------------------------------------- globals
 static HINSTANCE g_inst;
-static HWND g_main, g_set, g_stat;
-static HWND g_track[NP], g_val[NP];
+static HWND g_main;
 static int g_w = 1, g_h = 1;
 static bool g_fs = false, g_paused = false;
 static WINDOWPLACEMENT g_wpPrev = {sizeof(WINDOWPLACEMENT)};
@@ -555,6 +712,7 @@ static double g_fpsT = 0;
 static double g_lastMove = 0;
 static bool g_cursorHidden = false;
 static POINT g_lastMouse = {-1, -1};
+static std::wstring g_statText;
 
 static double now() {
     LARGE_INTEGER c;
@@ -693,8 +851,7 @@ static void audioUpdate(double t, float dt) {
     float att = 1.f - expf(-dt * 35.f), rl = 1.f - expf(-dt * 6.f);
     A.env += (rms > A.env ? att : rl) * (rms - A.env);
     A.bassEnv += (brms > A.bassEnv ? att : rl) * (brms - A.bassEnv);
-    // auto-gain: follow the recent peak, so quiet and loud content both move it
-    float pd = expf(-dt * 0.15f);
+    float pd = expf(-dt * 0.15f);   // auto-gain: follow the recent peak
     A.peak = std::max(std::max(A.peak * pd, A.env), 0.01f);
     A.bassPeak = std::max(std::max(A.bassPeak * pd, A.bassEnv), 0.01f);
     float sens = S.p[P_SENS];
@@ -704,6 +861,135 @@ static void audioUpdate(double t, float dt) {
     A.bass += (bs - A.bass) * (1.f - expf(-dt * 25.f));
 }
 
+// ---------------------------------------------------------------- battery
+static int g_batPct = -1;
+static bool g_charging = false;
+static double g_nextPower = 0;
+
+static void updatePower(double t) {
+    if (t < g_nextPower) return;
+    g_nextPower = t + 5.0;
+    SYSTEM_POWER_STATUS ps;
+    if (GetSystemPowerStatus(&ps) && ps.BatteryFlag != 128 && ps.BatteryLifePercent <= 100) {
+        g_batPct = ps.BatteryLifePercent;
+        g_charging = (ps.BatteryFlag & 8) != 0;
+    } else {
+        g_batPct = -1;
+        g_charging = false;
+    }
+}
+
+// ---------------------------------------------------------------- now playing (Windows media session, raw WinRT ABI)
+// Interface IDs and vtable order were read from Windows.Media.Control.winmd.
+static const GUID kIID_SessionManagerStatics = {0x2050C4EE, 0x11A0, 0x57DE, {0xAE, 0xD7, 0xC9, 0x7C, 0x70, 0x33, 0x82, 0x45}};
+static const GUID kIID_IAsyncInfo = {0x00000036, 0x0000, 0x0000, {0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}};
+
+template <class... T> static HRESULT vcall(void* o, int slot, T... a) {
+    typedef HRESULT(STDMETHODCALLTYPE * F)(void*, T...);
+    return ((F)((*(void***)o)[slot]))(o, a...);
+}
+static void urel(void*& p) { if (p) { ((IUnknown*)p)->Release(); p = nullptr; } }
+
+struct MediaState {
+    HRESULT(WINAPI* getFactory)(HSTRING, REFIID, void**) = nullptr;
+    HRESULT(WINAPI* createStr)(LPCWSTR, UINT32, HSTRING*) = nullptr;
+    HRESULT(WINAPI* deleteStr)(HSTRING) = nullptr;
+    PCWSTR(WINAPI* rawStr)(HSTRING, UINT32*) = nullptr;
+    void *statics = nullptr, *mgrOp = nullptr, *mgr = nullptr, *propsOp = nullptr;
+    double next = 0, retry = 0;
+    bool playing = false;
+    std::wstring title, artist;
+} M;
+
+static std::wstring takeHString(HSTRING h) {
+    std::wstring s;
+    if (!h) return s;
+    UINT32 len = 0;
+    PCWSTR p = M.rawStr(h, &len);
+    if (p) s.assign(p, len);
+    M.deleteStr(h);
+    return s;
+}
+
+static int asyncStatus(void* op) {   // 0 started, 1 completed, 2 canceled, 3 error
+    void* info = nullptr;
+    int st = 3;
+    if (SUCCEEDED(((IUnknown*)op)->QueryInterface(kIID_IAsyncInfo, &info)) && info) {
+        vcall(info, 7, &st);
+        urel(info);
+    }
+    return st;
+}
+
+static void mediaReset() {
+    urel(M.propsOp); urel(M.mgr); urel(M.mgrOp);
+    M.playing = false;
+    M.title.clear();
+    M.artist.clear();
+}
+
+static void mediaUpdate(double t) {
+    if (!S.showMedia) { if (M.mgr || M.mgrOp) mediaReset(); return; }
+    if (!M.statics) {
+        if (t < M.retry) return;
+        M.retry = t + 15.0;
+        HMODULE cb = GetModuleHandleW(L"combase.dll");
+        if (!cb) cb = LoadLibraryW(L"combase.dll");
+        if (!cb) return;
+        M.getFactory = (decltype(M.getFactory))(void*)GetProcAddress(cb, "RoGetActivationFactory");
+        M.createStr = (decltype(M.createStr))(void*)GetProcAddress(cb, "WindowsCreateString");
+        M.deleteStr = (decltype(M.deleteStr))(void*)GetProcAddress(cb, "WindowsDeleteString");
+        M.rawStr = (decltype(M.rawStr))(void*)GetProcAddress(cb, "WindowsGetStringRawBuffer");
+        if (!M.getFactory || !M.createStr || !M.deleteStr || !M.rawStr) return;
+        const wchar_t* cls = L"Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager";
+        HSTRING h = nullptr;
+        if (SUCCEEDED(M.createStr(cls, (UINT32)wcslen(cls), &h))) {
+            M.getFactory(h, kIID_SessionManagerStatics, &M.statics);
+            M.deleteStr(h);
+        }
+        return;
+    }
+    if (!M.mgr) {                                         // RequestAsync -> manager
+        if (!M.mgrOp) vcall(M.statics, 6, &M.mgrOp);
+        else {
+            int st = asyncStatus(M.mgrOp);
+            if (st == 1) vcall(M.mgrOp, 8, &M.mgr);
+            if (st >= 1) urel(M.mgrOp);
+        }
+        return;
+    }
+    if (M.propsOp) {                                      // TryGetMediaPropertiesAsync -> title / artist
+        int st = asyncStatus(M.propsOp);
+        if (st == 1) {
+            void* props = nullptr;
+            vcall(M.propsOp, 8, &props);
+            if (props) {
+                HSTRING h = nullptr;
+                if (SUCCEEDED(vcall(props, 6, &h))) M.title = takeHString(h);
+                h = nullptr;
+                if (SUCCEEDED(vcall(props, 9, &h))) M.artist = takeHString(h);
+                urel(props);
+            }
+        }
+        if (st >= 1) urel(M.propsOp);
+        return;
+    }
+    if (t < M.next) return;
+    M.next = t + 1.5;
+    void* sess = nullptr;
+    vcall(M.mgr, 6, &sess);                               // GetCurrentSession
+    if (!sess) { M.playing = false; return; }
+    void* pb = nullptr;
+    int status = 0;
+    if (SUCCEEDED(vcall(sess, 9, &pb)) && pb) {           // GetPlaybackInfo -> PlaybackStatus
+        vcall(pb, 7, &status);
+        urel(pb);
+    }
+    M.playing = status == 4;
+    if (M.playing) vcall(sess, 7, &M.propsOp);
+    urel(sess);
+}
+
 // ---------------------------------------------------------------- Direct3D 11
 static ID3D11Device* g_dev;
 static ID3D11DeviceContext* g_ctx;
@@ -711,17 +997,25 @@ static IDXGISwapChain1* g_sc;
 static ID3D11RenderTargetView* g_rtv;
 static int g_bbW = 0, g_bbH = 0;
 static ID3D11VertexShader* g_vs;
-static ID3D11PixelShader *g_psScene, *g_psComp;
-static ID3D11Buffer *g_cbOrb, *g_cbComp;
+static ID3D11PixelShader *g_psScene, *g_psComp, *g_psBright, *g_psBlur;
+static ID3D11Buffer *g_cbOrb, *g_cbComp, *g_cbPost;
 static ID3D11SamplerState* g_samp;
 static ID3D11RasterizerState* g_rast;
-static ID3D11Texture2D* g_sceneTex;
-static ID3D11RenderTargetView* g_sceneRtv;
-static ID3D11ShaderResourceView* g_sceneSrv;
-static int g_sceneW = 0, g_sceneH = 0;
+struct Target { ID3D11Texture2D* tex = nullptr; ID3D11RenderTargetView* rtv = nullptr; ID3D11ShaderResourceView* srv = nullptr; int w = 0, h = 0; };
+static Target g_scene, g_bloomA, g_bloomB;
 static ID3D11ShaderResourceView* g_textSrv;
 static std::wstring g_textKey;
 static int g_textW = 0, g_textH = 0, g_textPad = 0, g_textTh = 0;
+
+// Direct2D / DirectWrite (settings panel)
+static ID2D1Factory1* g_d2dF;
+static ID2D1Device* g_d2dDev;
+static ID2D1DeviceContext* g_d2d;
+static ID2D1RenderTarget* RT;  // same object, base interface (avoids C++ name hiding of older overloads)
+static IDWriteFactory* g_dw;
+static ID2D1SolidColorBrush* g_br;
+static Target g_ui;
+static ID2D1Bitmap1* g_uiBmp;
 
 typedef HRESULT(WINAPI* PFN_Compile)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHADER_MACRO*, ID3DInclude*, LPCSTR, LPCSTR,
                                      UINT, UINT, ID3DBlob**, ID3DBlob**);
@@ -748,19 +1042,52 @@ static void createBackbufferView() {
     bb->Release();
 }
 
+static void releaseTarget(Target& t) { rel(t.srv); rel(t.rtv); rel(t.tex); t.w = t.h = 0; }
+
+static void ensureTarget(Target& t, int w, int h) {
+    if (t.tex && t.w == w && t.h == h) return;
+    releaseTarget(t);
+    D3D11_TEXTURE2D_DESC td = {};
+    td.Width = w;
+    td.Height = h;
+    td.MipLevels = td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    g_dev->CreateTexture2D(&td, NULL, &t.tex);
+    g_dev->CreateRenderTargetView(t.tex, NULL, &t.rtv);
+    g_dev->CreateShaderResourceView(t.tex, NULL, &t.srv);
+    t.w = w;
+    t.h = h;
+}
+
+static IDWriteTextFormat *fTitle, *fHdr, *fBody, *fValR, *fSmall, *fSmallC, *fBtn;
+static float g_fmtScale = 0;
+
+static void releaseFormats() {
+    rel(fTitle); rel(fHdr); rel(fBody); rel(fValR); rel(fSmall); rel(fSmallC); rel(fBtn);
+    g_fmtScale = 0;
+}
+
 static void releaseD3D() {
     if (g_ctx) g_ctx->ClearState();
-    rel(g_textSrv); rel(g_sceneSrv); rel(g_sceneRtv); rel(g_sceneTex);
-    rel(g_rast); rel(g_samp); rel(g_cbComp); rel(g_cbOrb);
-    rel(g_psComp); rel(g_psScene); rel(g_vs); rel(g_rtv); rel(g_sc); rel(g_ctx); rel(g_dev);
-    g_sceneW = g_sceneH = 0;
+    if (g_d2d) g_d2d->SetTarget(nullptr);
+    rel(g_uiBmp); releaseTarget(g_ui); rel(g_br); releaseFormats();
+    rel(g_d2d); RT = nullptr; rel(g_d2dDev); rel(g_d2dF); rel(g_dw);
+    rel(g_textSrv);
+    releaseTarget(g_scene); releaseTarget(g_bloomA); releaseTarget(g_bloomB);
+    rel(g_rast); rel(g_samp); rel(g_cbPost); rel(g_cbComp); rel(g_cbOrb);
+    rel(g_psBlur); rel(g_psBright); rel(g_psComp); rel(g_psScene); rel(g_vs);
+    rel(g_rtv); rel(g_sc); rel(g_ctx); rel(g_dev);
     g_textKey.clear();
 }
 
 static bool initD3D(HWND hwnd) {
     // Default adapter = whatever Windows picks (Settings > Display > Graphics lets you choose per app).
     D3D_FEATURE_LEVEL fl = D3D_FEATURE_LEVEL_11_0;
-    HRESULT hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, D3D11_CREATE_DEVICE_SINGLETHREADED, &fl, 1,
+    HRESULT hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL,
+                                   D3D11_CREATE_DEVICE_SINGLETHREADED | D3D11_CREATE_DEVICE_BGRA_SUPPORT, &fl, 1,
                                    D3D11_SDK_VERSION, &g_dev, NULL, &g_ctx);
     if (FAILED(hr)) return false;
 
@@ -780,15 +1107,29 @@ static bool initD3D(HWND hwnd) {
     sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     hr = f2 ? f2->CreateSwapChainForHwnd(g_dev, hwnd, &sd, NULL, NULL, &g_sc) : E_FAIL;
     if (f2) f2->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
-    rel(f2); rel(ad); rel(dxdev);
-    if (FAILED(hr)) return false;
+    rel(f2); rel(ad);
+    if (FAILED(hr)) { rel(dxdev); return false; }
     createBackbufferView();
 
+    // Direct2D on the same device, for the settings panel
+    D2D1_FACTORY_OPTIONS fo = {D2D1_DEBUG_LEVEL_NONE};
+    if (SUCCEEDED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, __uuidof(ID2D1Factory1), &fo, (void**)&g_d2dF)) &&
+        SUCCEEDED(g_d2dF->CreateDevice(dxdev, &g_d2dDev)) &&
+        SUCCEEDED(g_d2dDev->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, &g_d2d))) {
+        RT = g_d2d;
+        D2D1_COLOR_F white = {1, 1, 1, 1};
+        RT->CreateSolidColorBrush(&white, NULL, &g_br);
+        RT->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+        DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory), (IUnknown**)&g_dw);
+    }
+    rel(dxdev);
+
     // Compiled shaders are cached next to the settings (keyed by a hash of the source), so only the
-    // first launch after an update pays the ~3 s compile.
-    const char* entries[3] = {"vs", "psScene", "psComp"};
-    const char* targets[3] = {"vs_5_0", "ps_5_0", "ps_5_0"};
-    std::string blobs[3];
+    // first launch after an update pays the compile.
+    const int NS = 5;
+    const char* entries[NS] = {"vs", "psScene", "psComp", "psBright", "psBlur"};
+    const char* targets[NS] = {"vs_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0"};
+    std::string blobs[NS];
     unsigned long long hsh = 1469598103934665603ull;
     for (const char* c = HLSL; *c; c++) hsh = (hsh ^ (unsigned char)*c) * 1099511628211ull;
     std::wstring cachePath = g_dataDir + L"\\shaders.bin";
@@ -796,7 +1137,7 @@ static bool initD3D(HWND hwnd) {
     if (FILE* f = _wfopen(cachePath.c_str(), L"rb")) {
         unsigned long long fh = 0;
         cached = fread(&fh, 8, 1, f) == 1 && fh == hsh;
-        for (int i = 0; cached && i < 3; i++) {
+        for (int i = 0; cached && i < NS; i++) {
             unsigned int n = 0;
             cached = fread(&n, 4, 1, f) == 1 && n > 0 && n < (64u << 20);
             if (cached) { blobs[i].resize(n); cached = fread(&blobs[i][0], 1, n, f) == n; }
@@ -810,7 +1151,7 @@ static bool initD3D(HWND hwnd) {
             MessageBoxW(NULL, L"d3dcompiler_47.dll is missing (it ships with Windows 10/11).", L"Orb", MB_ICONERROR);
             return false;
         }
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < NS; i++) {
             ID3DBlob* b = compileHLSL(compile, entries[i], targets[i]);
             blobs[i].assign((const char*)b->GetBufferPointer(), b->GetBufferSize());
             b->Release();
@@ -829,7 +1170,9 @@ static bool initD3D(HWND hwnd) {
     g_dev->CreateVertexShader(blobs[0].data(), blobs[0].size(), NULL, &g_vs);
     g_dev->CreatePixelShader(blobs[1].data(), blobs[1].size(), NULL, &g_psScene);
     g_dev->CreatePixelShader(blobs[2].data(), blobs[2].size(), NULL, &g_psComp);
-    if (!g_vs || !g_psScene || !g_psComp) { DeleteFileW(cachePath.c_str()); return false; }
+    g_dev->CreatePixelShader(blobs[3].data(), blobs[3].size(), NULL, &g_psBright);
+    g_dev->CreatePixelShader(blobs[4].data(), blobs[4].size(), NULL, &g_psBlur);
+    if (!g_vs || !g_psScene || !g_psComp || !g_psBright || !g_psBlur) { DeleteFileW(cachePath.c_str()); return false; }
 
     D3D11_BUFFER_DESC bd = {};
     bd.Usage = D3D11_USAGE_DEFAULT;
@@ -838,6 +1181,8 @@ static bool initD3D(HWND hwnd) {
     g_dev->CreateBuffer(&bd, NULL, &g_cbOrb);
     bd.ByteWidth = sizeof(CompCB);
     g_dev->CreateBuffer(&bd, NULL, &g_cbComp);
+    bd.ByteWidth = sizeof(PostCB);
+    g_dev->CreateBuffer(&bd, NULL, &g_cbPost);
 
     D3D11_SAMPLER_DESC smp = {};
     smp.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
@@ -851,24 +1196,6 @@ static bool initD3D(HWND hwnd) {
     rs.DepthClipEnable = TRUE;
     g_dev->CreateRasterizerState(&rs, &g_rast);
     return true;
-}
-
-static void ensureSceneTarget(int w, int h) {
-    if (g_sceneTex && g_sceneW == w && g_sceneH == h) return;
-    rel(g_sceneSrv); rel(g_sceneRtv); rel(g_sceneTex);
-    D3D11_TEXTURE2D_DESC td = {};
-    td.Width = w;
-    td.Height = h;
-    td.MipLevels = td.ArraySize = 1;
-    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    td.SampleDesc.Count = 1;
-    td.Usage = D3D11_USAGE_DEFAULT;
-    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-    g_dev->CreateTexture2D(&td, NULL, &g_sceneTex);
-    g_dev->CreateRenderTargetView(g_sceneTex, NULL, &g_sceneRtv);
-    g_dev->CreateShaderResourceView(g_sceneTex, NULL, &g_sceneSrv);
-    g_sceneW = w;
-    g_sceneH = h;
 }
 
 // ---------------------------------------------------------------- clock text
@@ -889,8 +1216,8 @@ static HFONT makeFont(int px, int weight, const wchar_t* face, const wchar_t* fa
     return f;
 }
 
-// Renders "12:34 ss" + date into a texture. Each element goes into its own colour channel so it can get its
-// own opacity: big digits = red (100%), seconds / AM-PM = green (60%), date = blue (72%).
+// Renders time, date/battery and now-playing into a texture. Each element goes into its own colour channel so
+// it can get its own opacity: big digits = red (100%), seconds / AM-PM / now playing = green (60%), date = blue (72%).
 static void updateClockTexture() {
     SYSTEMTIME st;
     GetLocalTime(&st);
@@ -903,43 +1230,63 @@ static void updateClockTexture() {
         GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, 0, &st, L"dddd, d MMMM", date, 128, NULL);
         CharUpperW(date);
     }
+    std::wstring dline = date;
+    if (S.showBattery && g_batPct >= 0) {
+        wchar_t b[32];
+        swprintf(b, 32, g_charging ? L"%d%%  CHARGING" : L"%d%%", g_batPct);
+        if (!dline.empty()) dline += L"   ·   ";
+        dline += b;
+    }
+    std::wstring np;
+    if (S.showMedia && M.playing && !M.title.empty()) {
+        np = L"♪   " + M.title;
+        if (!M.artist.empty()) np += L"   —   " + M.artist;
+        if (np.size() > 70) np = np.substr(0, 69) + L"…";
+    }
     int th = (int)clampf(g_bbH * 0.085f * S.p[P_CLOCKSIZE], 24.f, 420.f);
     wchar_t ks[32];
     swprintf(ks, 32, L"|%d", th);
-    std::wstring key = std::wstring(hm) + L"|" + small + L"|" + date + ks;
+    std::wstring key = std::wstring(hm) + L"|" + small + L"|" + dline + L"|" + np + ks;
     if (key == g_textKey && g_textSrv) return;
     g_textKey = key;
 
-    int sh = std::max(8, th * 36 / 100), dh = std::max(9, th * 17 / 100);
+    int sh = std::max(8, th * 36 / 100), dh = std::max(9, th * 17 / 100), nh = std::max(9, th * 19 / 100);
     HFONT fBig = makeFont(th, FW_LIGHT, L"Segoe UI Variable Display", L"Segoe UI");
-    HFONT fSmall = makeFont(sh, FW_NORMAL, L"Segoe UI Variable Display", L"Segoe UI");
+    HFONT fSm = makeFont(sh, FW_NORMAL, L"Segoe UI Variable Display", L"Segoe UI");
     HFONT fDate = makeFont(dh, FW_SEMIBOLD, L"Segoe UI Variable Text", L"Segoe UI");
+    HFONT fNp = makeFont(nh, FW_NORMAL, L"Segoe UI Variable Text", L"Segoe UI");
     HDC mdc = CreateCompatibleDC(NULL);
     HGDIOBJ oldFont = SelectObject(mdc, fBig);
 
     int bigExtra = th / 40, dateExtra = dh * 28 / 100, gapSmall = th / 9;
-    TEXTMETRICW tmB, tmD;
-    SIZE sBig, sSmall = {0, 0}, sDate = {0, 0};
+    TEXTMETRICW tmB, tmD, tmN;
+    SIZE sBig, sSmall = {0, 0}, sDate = {0, 0}, sNp = {0, 0};
     SetTextCharacterExtra(mdc, bigExtra);
     GetTextMetricsW(mdc, &tmB);
     GetTextExtentPoint32W(mdc, hm, (int)wcslen(hm), &sBig);
-    SelectObject(mdc, fSmall);
+    SelectObject(mdc, fSm);
     SetTextCharacterExtra(mdc, 0);
     if (*small) GetTextExtentPoint32W(mdc, small, (int)wcslen(small), &sSmall);
     SelectObject(mdc, fDate);
     SetTextCharacterExtra(mdc, dateExtra);
     GetTextMetricsW(mdc, &tmD);
-    if (*date) GetTextExtentPoint32W(mdc, date, (int)wcslen(date), &sDate);
+    if (!dline.empty()) GetTextExtentPoint32W(mdc, dline.c_str(), (int)dline.size(), &sDate);
+    SelectObject(mdc, fNp);
+    SetTextCharacterExtra(mdc, 0);
+    GetTextMetricsW(mdc, &tmN);
+    if (!np.empty()) GetTextExtentPoint32W(mdc, np.c_str(), (int)np.size(), &sNp);
 
     int pad = std::max(4, th / 8);
     int capB = tmB.tmAscent - tmB.tmInternalLeading;
     int line1W = sBig.cx + (*small ? gapSmall + sSmall.cx : 0);
     int line1H = capB + tmB.tmDescent / 4;
-    int gap = th * 22 / 100;
+    int gap = th * 22 / 100, gap3 = th * 16 / 100;
     int capD = tmD.tmAscent - tmD.tmInternalLeading;
-    int line2H = *date ? capD + tmD.tmDescent : 0;
-    int W = std::max(line1W, (int)sDate.cx) + pad * 2;
-    int H = line1H + (*date ? gap + line2H : 0) + pad * 2;
+    int line2H = !dline.empty() ? capD + tmD.tmDescent : 0;
+    int capN = tmN.tmAscent - tmN.tmInternalLeading;
+    int line3H = !np.empty() ? capN + tmN.tmDescent : 0;
+    int W = std::max(std::max(line1W, (int)sDate.cx), (int)sNp.cx) + pad * 2;
+    int H = line1H + (line2H ? gap + line2H : 0) + (line3H ? gap3 + line3H : 0) + pad * 2;
 
     BITMAPINFO bi = {};
     bi.bmiHeader.biSize = sizeof bi.bmiHeader;
@@ -954,22 +1301,29 @@ static void updateClockTexture() {
     SetBkMode(mdc, TRANSPARENT);
     SetTextAlign(mdc, TA_BASELINE | TA_LEFT);
 
-    int x0 = (W - line1W) / 2, base1 = pad + capB;
+    int x0 = (W - line1W) / 2, base1 = pad + capB, y = pad + line1H;
     SelectObject(mdc, fBig);
     SetTextCharacterExtra(mdc, bigExtra);
     SetTextColor(mdc, RGB(255, 0, 0));
     TextOutW(mdc, x0, base1, hm, (int)wcslen(hm));
     if (*small) {
-        SelectObject(mdc, fSmall);
+        SelectObject(mdc, fSm);
         SetTextCharacterExtra(mdc, 0);
         SetTextColor(mdc, RGB(0, 255, 0));
         TextOutW(mdc, x0 + sBig.cx + gapSmall, base1, small, (int)wcslen(small));
     }
-    if (*date) {
+    if (line2H) {
         SelectObject(mdc, fDate);
         SetTextCharacterExtra(mdc, dateExtra);
         SetTextColor(mdc, RGB(0, 0, 255));
-        TextOutW(mdc, (W - sDate.cx) / 2 + dateExtra / 2, pad + line1H + gap + capD, date, (int)wcslen(date));
+        TextOutW(mdc, (W - sDate.cx) / 2 + dateExtra / 2, y + gap + capD, dline.c_str(), (int)dline.size());
+        y += gap + line2H;
+    }
+    if (line3H) {
+        SelectObject(mdc, fNp);
+        SetTextCharacterExtra(mdc, 0);
+        SetTextColor(mdc, RGB(0, 255, 0));
+        TextOutW(mdc, (W - sNp.cx) / 2, y + gap3 + capN, np.c_str(), (int)np.size());
     }
     GdiFlush();
 
@@ -1005,9 +1359,587 @@ static void updateClockTexture() {
     SelectObject(mdc, oldFont);
     DeleteObject(bmp);
     DeleteObject(fBig);
-    DeleteObject(fSmall);
+    DeleteObject(fSm);
     DeleteObject(fDate);
+    DeleteObject(fNp);
     DeleteDC(mdc);
+}
+
+// ---------------------------------------------------------------- fullscreen + save
+static void toggleFullscreen() {
+    DWORD style = (DWORD)GetWindowLongPtrW(g_main, GWL_STYLE);
+    if (!g_fs) {
+        MONITORINFO mi = {sizeof mi};
+        if (GetWindowPlacement(g_main, &g_wpPrev) &&
+            GetMonitorInfoW(MonitorFromWindow(g_main, MONITOR_DEFAULTTONEAREST), &mi)) {
+            SetWindowLongPtrW(g_main, GWL_STYLE, (style & ~WS_OVERLAPPEDWINDOW) | WS_POPUP);
+            SetWindowPos(g_main, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
+                         mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top,
+                         SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+            g_fs = true;
+        }
+    } else {
+        SetWindowLongPtrW(g_main, GWL_STYLE, (style & ~WS_POPUP) | WS_OVERLAPPEDWINDOW);
+        SetWindowPlacement(g_main, &g_wpPrev);
+        SetWindowPos(g_main, NULL, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+        g_fs = false;
+    }
+    g_dirty = true;
+}
+
+static void saveSettings() {
+    for (int i = 0; i < NP; i++) iniWF(L"orb", PD[i].key, S.p[i]);
+    for (int i = 0; i < 4; i++) {
+        wchar_t key[8], b[16];
+        swprintf(key, 8, L"c%d", i);
+        swprintf(b, 16, L"#%02x%02x%02x", GetRValue(S.c[i]), GetGValue(S.c[i]), GetBValue(S.c[i]));
+        WritePrivateProfileStringW(L"orb", key, b, g_ini.c_str());
+    }
+    iniWF(L"orb", L"drift", S.drift);
+    iniWF(L"orb", L"automorph", S.autoMorph);
+    iniWF(L"orb", L"h24", S.h24);
+    iniWF(L"orb", L"seconds", S.seconds);
+    iniWF(L"orb", L"date", S.showDate);
+    iniWF(L"orb", L"audio", S.audio);
+    iniWF(L"orb", L"battery", S.showBattery);
+    iniWF(L"orb", L"media", S.showMedia);
+    iniWF(L"orb", L"aa", S.aa);
+    iniWF(L"orb", L"fps", S.fps);
+    iniWF(L"orb", L"form", S.form);
+    iniWF(L"orb", L"clockstyle", S.clockStyle);
+    iniWF(L"orb", L"clockpos", S.clockPos);
+
+    if (g_main) {
+        WINDOWPLACEMENT wp = {sizeof wp};
+        if (g_fs) wp = g_wpPrev;
+        else GetWindowPlacement(g_main, &wp);
+        RECT& r = wp.rcNormalPosition;
+        iniWF(L"window", L"x", r.left);
+        iniWF(L"window", L"y", r.top);
+        iniWF(L"window", L"w", r.right - r.left);
+        iniWF(L"window", L"h", r.bottom - r.top);
+        iniWF(L"window", L"fullscreen", g_fs);
+    }
+    g_dirty = false;
+}
+
+static void pickColor(int i) {
+    static COLORREF custom[16];
+    CHOOSECOLORW cc = {sizeof cc};
+    cc.hwndOwner = g_main;
+    cc.rgbResult = S.c[i];
+    cc.lpCustColors = custom;
+    cc.Flags = CC_FULLOPEN | CC_RGBINIT | CC_ANYCOLOR;
+    if (ChooseColorW(&cc)) {
+        S.c[i] = cc.rgbResult;
+        g_dirty = true;
+    }
+}
+
+// ---------------------------------------------------------------- settings panel (immediate-mode UI, Direct2D)
+// The panel is drawn every frame while visible into a texture; the composite shader puts it on a dark liquid-glass
+// sheet that slides in from the right. Every widget eases its hover / press / value state for fluid motion.
+static bool g_uiOpen = false;
+static float g_uiT = 0;
+static float g_uiRect[4];
+static float g_mx = -1, g_my = -1, g_wheel = 0;
+static bool g_mDown = false, g_mPressed = false;
+static int g_uiActive = -1, g_pendingColor = -1;
+static float g_scroll = 0, g_scrollT = 0, g_contentH = 0;
+static float g_anim[512][2];
+static bool g_animInit[512];
+static float g_secH[16];
+
+struct UiFrame {
+    float s, W, H, pad, cw, y, mx, my, dt;
+    bool inside, pressed, down;
+    int id, sec;
+    float secY;
+    D2D1_COLOR_F acc;
+} U;
+
+static D2D1_COLOR_F C4(float r, float g, float b, float a) { D2D1_COLOR_F c = {r, g, b, a}; return c; }
+static D2D1_COLOR_F WA(float a) { return C4(1, 1, 1, a); }
+static D2D1_COLOR_F CRA(COLORREF c, float a) { return C4(GetRValue(c) / 255.f, GetGValue(c) / 255.f, GetBValue(c) / 255.f, a); }
+static D2D1_COLOR_F withA(D2D1_COLOR_F c, float a) { c.a = a; return c; }
+static D2D1_COLOR_F mixC(D2D1_COLOR_F a, D2D1_COLOR_F b, float t) {
+    return C4(a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t, a.b + (b.b - a.b) * t, a.a + (b.a - a.a) * t);
+}
+static D2D1_RECT_F RC(float x, float y, float w, float h) { D2D1_RECT_F r = {x, y, x + w, y + h}; return r; }
+static D2D1_POINT_2F PT(float x, float y) { D2D1_POINT_2F p = {x, y}; return p; }
+
+static void fRR(float x, float y, float w, float h, float r, D2D1_COLOR_F c) {
+    g_br->SetColor(&c);
+    D2D1_ROUNDED_RECT rr = {RC(x, y, w, h), r, r};
+    RT->FillRoundedRectangle(&rr, g_br);
+}
+static void sRR(float x, float y, float w, float h, float r, D2D1_COLOR_F c, float th) {
+    g_br->SetColor(&c);
+    D2D1_ROUNDED_RECT rr = {RC(x, y, w, h), r, r};
+    RT->DrawRoundedRectangle(&rr, g_br, th, NULL);
+}
+static void fEl(float cx, float cy, float r, D2D1_COLOR_F c) {
+    g_br->SetColor(&c);
+    D2D1_ELLIPSE e = {PT(cx, cy), r, r};
+    RT->FillEllipse(&e, g_br);
+}
+static void sEl(float cx, float cy, float rx, float ry, D2D1_COLOR_F c, float th) {
+    g_br->SetColor(&c);
+    D2D1_ELLIPSE e = {PT(cx, cy), rx, ry};
+    RT->DrawEllipse(&e, g_br, th, NULL);
+}
+static void ln(float x0, float y0, float x1, float y1, D2D1_COLOR_F c, float th) {
+    g_br->SetColor(&c);
+    RT->DrawLine(PT(x0, y0), PT(x1, y1), g_br, th, NULL);
+}
+static void txt(const std::wstring& s, IDWriteTextFormat* f, float x, float y, float w, float h, D2D1_COLOR_F c) {
+    if (!f || s.empty()) return;
+    g_br->SetColor(&c);
+    D2D1_RECT_F r = RC(x, y, w, h);
+    RT->DrawText(s.c_str(), (UINT32)s.size(), f, &r, g_br, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
+}
+static void ease(float& v, float target, float rate) { v += (target - v) * (1.f - expf(-rate * U.dt)); }
+static float& AN(int id, int k, float init) {
+    id &= 511;
+    if (!g_animInit[id]) { g_animInit[id] = true; g_anim[id][0] = 0; g_anim[id][1] = init; }
+    return g_anim[id][k];
+}
+static bool over(float x, float y, float w, float h) {
+    return U.inside && U.mx >= x && U.mx < x + w && U.my >= y && U.my < y + h;
+}
+
+static IDWriteTextFormat* makeFormat(const wchar_t* family, DWRITE_FONT_WEIGHT wt, float size,
+                                     DWRITE_TEXT_ALIGNMENT ta, DWRITE_PARAGRAPH_ALIGNMENT pa, bool wrap) {
+    IDWriteTextFormat* f = nullptr;
+    if (!g_dw) return nullptr;
+    g_dw->CreateTextFormat(family, NULL, wt, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, size, L"", &f);
+    if (f) {
+        f->SetTextAlignment(ta);
+        f->SetParagraphAlignment(pa);
+        f->SetWordWrapping(wrap ? DWRITE_WORD_WRAPPING_WRAP : DWRITE_WORD_WRAPPING_NO_WRAP);
+    }
+    return f;
+}
+
+static void makeFormats(float s) {
+    releaseFormats();
+    const wchar_t *disp = L"Segoe UI Variable Display", *text = L"Segoe UI Variable Text";
+    fTitle = makeFormat(disp, DWRITE_FONT_WEIGHT_SEMI_BOLD, 24 * s, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, false);
+    fHdr = makeFormat(text, DWRITE_FONT_WEIGHT_SEMI_BOLD, 11 * s, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, false);
+    fBody = makeFormat(text, DWRITE_FONT_WEIGHT_NORMAL, 13.5f * s, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, false);
+    fValR = makeFormat(text, DWRITE_FONT_WEIGHT_NORMAL, 12.5f * s, DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, false);
+    fSmall = makeFormat(text, DWRITE_FONT_WEIGHT_NORMAL, 11.5f * s, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_NEAR, true);
+    fSmallC = makeFormat(text, DWRITE_FONT_WEIGHT_NORMAL, 11.5f * s, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, false);
+    fBtn = makeFormat(text, DWRITE_FONT_WEIGHT_SEMI_BOLD, 13 * s, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, false);
+    g_fmtScale = s;
+}
+
+static void uiEndSection() {
+    if (U.sec >= 0) g_secH[U.sec] = U.y - U.secY;
+    U.sec = -1;
+}
+static void uiSection(int sec, const wchar_t* title) {
+    uiEndSection();
+    U.y += 16 * U.s;
+    txt(title, fHdr, U.pad, U.y, U.cw, 16 * U.s, WA(0.42f));
+    U.y += 26 * U.s;
+    if (g_secH[sec] > 0) fRR(U.pad - 14 * U.s, U.y - 8 * U.s, U.cw + 28 * U.s, g_secH[sec] + 14 * U.s, 16 * U.s, WA(0.045f));
+    U.sec = sec;
+    U.secY = U.y;
+}
+
+static void fmtVal(int i, wchar_t* b) {
+    if (PD[i].fmt == FMT_PCT) swprintf(b, 32, L"%d%%", (int)lroundf(S.p[i] * 100));
+    else if (PD[i].fmt == FMT_SEC) swprintf(b, 32, L"%d s", (int)lroundf(S.p[i]));
+    else swprintf(b, 32, L"%.2f", S.p[i]);
+}
+
+static void uiSlider(int pi) {
+    int id = U.id++;
+    float x = U.pad, w = U.cw, h = 46 * U.s, y = U.y;
+    bool hover = over(x - 6 * U.s, y, w + 12 * U.s, h);
+    if (hover && U.pressed) g_uiActive = id;
+    bool act = g_uiActive == id;
+    float range = PD[pi].mx - PD[pi].mn;
+    if (act && U.down) {
+        float nv = PD[pi].mn + range * clampf((U.mx - x) / w, 0, 1);
+        if (nv != S.p[pi]) { S.p[pi] = nv; g_dirty = true; }
+    }
+    float target = (S.p[pi] - PD[pi].mn) / range;
+    float& va = AN(id, 1, target);
+    float& ha = AN(id, 0, 0);
+    ease(ha, (hover || act) ? 1.f : 0.f, 14);
+    ease(va, target, act ? 40.f : 14.f);
+
+    wchar_t vb[32];
+    fmtVal(pi, vb);
+    txt(PD[pi].label, fBody, x, y + 2 * U.s, w, 22 * U.s, WA(0.82f + 0.18f * ha));
+    txt(vb, fValR, x, y + 2 * U.s, w, 22 * U.s, WA(0.45f + 0.35f * ha));
+    float ty = y + 33 * U.s, th = (4 + 2 * ha) * U.s;
+    fRR(x, ty - th / 2, w, th, th / 2, WA(0.10f + 0.04f * ha));
+    if (va > 0.002f) fRR(x, ty - th / 2, std::max(th, w * va), th, th / 2, withA(U.acc, 0.85f + 0.15f * ha));
+    float kx = x + w * va, kr = (6.5f + 2.5f * ha) * U.s;
+    if (ha > 0.01f) fEl(kx, ty, kr + 7 * U.s * ha, withA(U.acc, 0.22f * ha));
+    fEl(kx, ty, kr, WA(1));
+    U.y += h;
+}
+
+static bool uiToggle(const wchar_t* label, bool* v) {
+    int id = U.id++;
+    float x = U.pad, w = U.cw, h = 40 * U.s, y = U.y;
+    bool hover = over(x - 6 * U.s, y, w + 12 * U.s, h), changed = false;
+    if (hover && U.pressed) { *v = !*v; g_dirty = true; changed = true; }
+    float& a = AN(id, 1, *v ? 1.f : 0.f);
+    float& ha = AN(id, 0, 0);
+    ease(a, *v ? 1.f : 0.f, 13);
+    ease(ha, hover ? 1.f : 0.f, 14);
+    txt(label, fBody, x, y, w - 60 * U.s, h, WA(0.82f + 0.18f * ha));
+    float sw = 42 * U.s, sh = 24 * U.s, sx = x + w - sw, sy = y + (h - sh) / 2;
+    fRR(sx, sy, sw, sh, sh / 2, mixC(WA(0.12f + 0.06f * ha), withA(U.acc, 0.95f), a));
+    float kr = sh / 2 - 3 * U.s;
+    float kx = sx + sh / 2 + (sw - sh) * a;
+    fEl(kx, sy + sh / 2 + 1 * U.s, kr, C4(0, 0, 0, 0.18f));
+    fEl(kx, sy + sh / 2, kr * (1 + 0.06f * ha), WA(1));
+    U.y += h;
+    return changed;
+}
+
+static void uiSegment(const wchar_t* const* items, int n, int* sel) {
+    int id = U.id++;
+    float x = U.pad, w = U.cw, h = 36 * U.s, y = U.y + 2 * U.s, iw = w / n;
+    for (int i = 0; i < n; i++)
+        if (over(x + i * iw, y, iw, h) && U.pressed) { *sel = i; g_dirty = true; }
+    float& pos = AN(id, 1, (float)*sel);
+    ease(pos, (float)*sel, 14);
+    fRR(x, y, w, h, h / 2, WA(0.06f));
+    fRR(x + pos * iw + 3 * U.s, y + 3 * U.s, iw - 6 * U.s, h - 6 * U.s, (h - 6 * U.s) / 2, withA(U.acc, 0.32f));
+    sRR(x + pos * iw + 3 * U.s, y + 3 * U.s, iw - 6 * U.s, h - 6 * U.s, (h - 6 * U.s) / 2, withA(U.acc, 0.7f), 1 * U.s);
+    for (int i = 0; i < n; i++) {
+        float k = 1.f - std::min(1.f, fabsf(pos - i));
+        txt(items[i], fBtn, x + i * iw, y, iw, h, WA(0.55f + 0.45f * k));
+    }
+    U.y += h + 10 * U.s;
+}
+
+static int uiCycle(const wchar_t* label, const wchar_t* value) {
+    int id = U.id++;
+    float x = U.pad, w = U.cw, h = 40 * U.s, y = U.y;
+    float pw = 176 * U.s, ph = 30 * U.s, px = x + w - pw, py = y + (h - ph) / 2;
+    bool hl = over(px, py, pw / 2, ph), hr = over(px + pw / 2, py, pw / 2, ph);
+    float& a = AN(id, 0, 0);
+    ease(a, (hl || hr) ? 1.f : 0.f, 14);
+    txt(label, fBody, x, y, w - pw, h, WA(0.82f));
+    fRR(px, py, pw, ph, ph / 2, WA(0.07f + 0.05f * a));
+    txt(value, fBtn, px + 20 * U.s, py, pw - 40 * U.s, ph, WA(0.92f));
+    txt(L"‹", fBtn, px + 4 * U.s, py - 1 * U.s, 22 * U.s, ph, WA(hl ? 1.f : 0.45f));
+    txt(L"›", fBtn, px + pw - 26 * U.s, py - 1 * U.s, 22 * U.s, ph, WA(hr ? 1.f : 0.45f));
+    U.y += h;
+    if (U.pressed && hl) return -1;
+    if (U.pressed && hr) return 1;
+    return 0;
+}
+
+static int uiButtons2(const wchar_t* a, const wchar_t* b) {
+    float gap = 10 * U.s, bw = (U.cw - gap) / 2, h = 38 * U.s, y = U.y + 6 * U.s;
+    int res = 0;
+    for (int k = 0; k < 2; k++) {
+        int id = U.id++;
+        float x = U.pad + k * (bw + gap);
+        bool hv = over(x, y, bw, h);
+        float& ha = AN(id, 0, 0);
+        ease(ha, hv ? 1.f : 0.f, 14);
+        D2D1_COLOR_F bg = k == 0 ? withA(U.acc, 0.30f + 0.20f * ha) : WA(0.07f + 0.06f * ha);
+        fRR(x, y, bw, h, h / 2, bg);
+        txt(k == 0 ? a : b, fBtn, x, y, bw, h, WA(0.95f));
+        if (hv && U.pressed) res = k + 1;
+    }
+    U.y += h + 12 * U.s;
+    return res;
+}
+
+static void drawFormIcon(int f, float cx, float cy, float r, D2D1_COLOR_F c) {
+    float th = 1.6f * U.s;
+    switch (f) {
+    case 0:
+        sEl(cx, cy, r, r, c, th);
+        fEl(cx - r * 0.32f, cy - r * 0.32f, r * 0.26f, withA(c, c.a * 0.8f));
+        break;
+    case 1:
+        sEl(cx - r * 0.35f, cy + r * 0.12f, r * 0.62f, r * 0.62f, c, th);
+        sEl(cx + r * 0.40f, cy - r * 0.22f, r * 0.52f, r * 0.52f, c, th);
+        break;
+    case 2:
+        sEl(cx, cy, r, r * 0.55f, c, th * 1.8f);
+        break;
+    case 3: {
+        float a = r * 0.87f, b = r * 0.5f;
+        ln(cx, cy - r, cx + a, cy - b, c, th); ln(cx + a, cy - b, cx + a, cy + b, c, th);
+        ln(cx + a, cy + b, cx, cy + r, c, th); ln(cx, cy + r, cx - a, cy + b, c, th);
+        ln(cx - a, cy + b, cx - a, cy - b, c, th); ln(cx - a, cy - b, cx, cy - r, c, th);
+        ln(cx, cy, cx - a, cy - b, c, th); ln(cx, cy, cx + a, cy - b, c, th); ln(cx, cy, cx, cy + r, c, th);
+        break;
+    }
+    case 4: {
+        float a = r * 0.72f;
+        ln(cx, cy - r, cx + a, cy - r * 0.1f, c, th); ln(cx + a, cy - r * 0.1f, cx, cy + r, c, th);
+        ln(cx, cy + r, cx - a, cy - r * 0.1f, c, th); ln(cx - a, cy - r * 0.1f, cx, cy - r, c, th);
+        ln(cx - a, cy - r * 0.1f, cx + a, cy - r * 0.1f, withA(c, c.a * 0.6f), th);
+        break;
+    }
+    case 5:
+        for (int k = 0; k < 3; k++) {
+            float yy = cy + (k - 1) * r * 0.48f;
+            float px0 = cx - r, py0 = yy;
+            for (int i = 1; i <= 12; i++) {
+                float px1 = cx - r + 2 * r * i / 12.f, py1 = yy + sinf(i * 0.9f + k) * r * 0.16f;
+                ln(px0, py0, px1, py1, withA(c, c.a * (1.f - 0.25f * k)), th);
+                px0 = px1;
+                py0 = py1;
+            }
+        }
+        break;
+    default:
+        for (int k = 0; k < 10; k++) {
+            float a = k * 0.85f, rr = r * (0.1f + k * 0.09f);
+            fEl(cx + cosf(a) * rr, cy + sinf(a) * rr, r * (0.17f - k * 0.011f), c);
+        }
+        break;
+    }
+}
+
+static void uiForms() {
+    float gap = 8 * U.s, cwid = (U.cw - gap * 3) / 4, ch = 70 * U.s;
+    for (int i = 0; i < NUM_FORMS; i++) {
+        int id = U.id++;
+        float x = U.pad + (i % 4) * (cwid + gap), y = U.y + (i / 4) * (ch + gap);
+        bool hv = over(x, y, cwid, ch);
+        if (hv && U.pressed && S.form != i) setForm(i, 1.6);
+        float& sa = AN(id, 1, S.form == i ? 1.f : 0.f);
+        float& ha = AN(id, 0, 0);
+        ease(ha, hv ? 1.f : 0.f, 14);
+        ease(sa, S.form == i ? 1.f : 0.f, 10);
+        fRR(x, y, cwid, ch, 14 * U.s, mixC(WA(0.05f + 0.05f * ha), withA(U.acc, 0.24f), sa));
+        if (sa > 0.01f) sRR(x + 0.5f, y + 0.5f, cwid - 1, ch - 1, 14 * U.s, withA(U.acc, 0.85f * sa), 1.2f * U.s);
+        D2D1_COLOR_F ic = mixC(WA(0.62f + 0.25f * ha), WA(1), sa);
+        drawFormIcon(i, x + cwid / 2, y + 27 * U.s - 2 * U.s * ha, 11.5f * U.s, ic);
+        txt(FORM_NAMES[i], fSmallC, x, y + 46 * U.s, cwid, 18 * U.s, WA(0.55f + 0.45f * std::max(ha, sa)));
+    }
+    U.y += 2 * (ch + gap) + 4 * U.s;
+}
+
+static void uiPalette() {
+    float d = 32 * U.s, gap = 12 * U.s;
+    int per = std::max(1, (int)((U.cw + gap) / (d + gap)));
+    const wchar_t* caption = L"Custom";
+    for (int i = 0; i < NUM_PRESETS; i++) {
+        bool on = true;
+        for (int k = 0; k < 4; k++) on = on && PRESETS[i].c[k] == S.c[k];
+        if (on) caption = PRESETS[i].name;
+    }
+    for (int i = 0; i < NUM_PRESETS; i++) {
+        int id = U.id++;
+        const Preset& p = PRESETS[i];
+        float cx = U.pad + (i % per) * (d + gap) + d / 2, cy = U.y + (i / per) * (d + gap) + d / 2;
+        bool hv = over(cx - d / 2, cy - d / 2, d, d);
+        bool on = true;
+        for (int k = 0; k < 4; k++) on = on && p.c[k] == S.c[k];
+        if (hv && U.pressed) { for (int k = 0; k < 4; k++) S.c[k] = p.c[k]; g_dirty = true; }
+        if (hv) caption = p.name;
+        float& sa = AN(id, 1, on ? 1.f : 0.f);
+        float& ha = AN(id, 0, 0);
+        ease(ha, hv ? 1.f : 0.f, 14);
+        ease(sa, on ? 1.f : 0.f, 12);
+        float r = d / 2 * (1 + 0.08f * ha);
+        D2D1_GRADIENT_STOP stops[3] = {{0.f, CRA(p.c[1], 1)}, {0.55f, CRA(p.c[2], 1)}, {1.f, CRA(p.c[3], 1)}};
+        ID2D1GradientStopCollection* coll = nullptr;
+        ID2D1LinearGradientBrush* gb = nullptr;
+        RT->CreateGradientStopCollection(stops, 3, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP, &coll);
+        if (coll) {
+            D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES lp = {PT(cx - r, cy - r), PT(cx + r, cy + r)};
+            RT->CreateLinearGradientBrush(&lp, NULL, coll, &gb);
+        }
+        if (gb) {
+            D2D1_ELLIPSE e = {PT(cx, cy), r, r};
+            RT->FillEllipse(&e, gb);
+        }
+        rel(gb);
+        rel(coll);
+        if (sa > 0.01f) sEl(cx, cy, r + 4.5f * U.s, r + 4.5f * U.s, WA(0.9f * sa), 2 * U.s);
+    }
+    int rows = (NUM_PRESETS + per - 1) / per;
+    U.y += rows * (d + gap);
+    txt(caption, fSmall, U.pad, U.y - 4 * U.s, U.cw, 18 * U.s, WA(0.5f));
+    U.y += 20 * U.s;
+
+    float gap2 = 8 * U.s, bw = (U.cw - gap2 * 3) / 4, bh = 34 * U.s;
+    for (int i = 0; i < 4; i++) {
+        int id = U.id++;
+        float x = U.pad + i * (bw + gap2);
+        bool hv = over(x, U.y, bw, bh);
+        if (hv && U.pressed) g_pendingColor = i;
+        float& ha = AN(id, 0, 0);
+        ease(ha, hv ? 1.f : 0.f, 14);
+        COLORREF c = S.c[i];
+        fRR(x, U.y, bw, bh, 10 * U.s, CRA(c, 1));
+        sRR(x + 0.5f, U.y + 0.5f, bw - 1, bh - 1, 10 * U.s, WA(0.12f + 0.5f * ha), 1 * U.s);
+        int lum = (GetRValue(c) * 299 + GetGValue(c) * 587 + GetBValue(c) * 114) / 1000;
+        txt(COLOR_NAMES[i], fSmallC, x, U.y, bw, bh, lum > 140 ? C4(0.04f, 0.06f, 0.1f, 0.9f) : WA(0.9f));
+    }
+    U.y += bh + 8 * U.s;
+}
+
+static void drawUi(float dt) {
+    if (!RT || !g_dw) return;
+    float s = clampf(g_bbH / 1080.f, 0.8f, 2.0f);
+    float m = 16 * s, w = floorf(std::min(410 * s, g_bbW - 2 * m)), h = floorf(g_bbH - 2 * m);
+    if (w < 50 || h < 50) return;
+    ensureTarget(g_ui, (int)w, (int)h);
+    static ID3D11Texture2D* bmpTex = nullptr;   // the texture g_uiBmp draws into; rebuild when it was replaced
+    if (!g_uiBmp || bmpTex != g_ui.tex) {
+        bmpTex = g_ui.tex;
+        rel(g_uiBmp);
+        IDXGISurface* surf = nullptr;
+        g_ui.tex->QueryInterface(__uuidof(IDXGISurface), (void**)&surf);
+        D2D1_BITMAP_PROPERTIES1 bp = {};
+        bp.pixelFormat.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        bp.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
+        bp.dpiX = bp.dpiY = 96;
+        bp.bitmapOptions = (D2D1_BITMAP_OPTIONS)(D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW);
+        if (surf) g_d2d->CreateBitmapFromDxgiSurface(surf, &bp, &g_uiBmp);
+        rel(surf);
+        if (!g_uiBmp) return;
+    }
+    if (fabsf(s - g_fmtScale) > 0.01f) makeFormats(s);
+
+    float e = g_uiT;
+    float x = (float)g_bbW - m - w + (1.f - e) * (w + m + 40 * s);
+    g_uiRect[0] = floorf(x); g_uiRect[1] = m; g_uiRect[2] = w; g_uiRect[3] = h;
+    float lx = g_mx - g_uiRect[0], ly = g_my - g_uiRect[1];
+    bool inPanel = g_uiOpen && lx >= 0 && ly >= 0 && lx < w && ly < h;
+    float headerH = 70 * s;
+
+    U = UiFrame();
+    U.s = s; U.W = w; U.H = h; U.dt = dt; U.pad = 30 * s; U.cw = w - 2 * U.pad; U.sec = -1;
+    if (inPanel && g_wheel != 0) g_scrollT -= g_wheel / 120.f * 80 * s;
+    float maxScroll = std::max(0.f, g_contentH - (h - headerH));
+    g_scrollT = clampf(g_scrollT, 0, maxScroll);
+    ease(g_scroll, g_scrollT, 16);
+    U.mx = lx;
+    U.my = ly - headerH + g_scroll;
+    U.inside = inPanel && ly > headerH;
+    U.pressed = g_mPressed && U.inside;
+    U.down = g_mDown;
+    if (!g_mDown) g_uiActive = -1;
+    // accent for the UI = the palette's Mid colour, nudged brighter so it always reads on the dark glass
+    D2D1_COLOR_F acc = CRA(S.c[1], 1);
+    float al = 0.3f * acc.r + 0.59f * acc.g + 0.11f * acc.b;
+    U.acc = mixC(acc, WA(1), al < 0.45f ? 0.3f : 0.1f);
+
+    g_d2d->SetTarget(g_uiBmp);
+    RT->BeginDraw();
+    D2D1_COLOR_F clear = {0, 0, 0, 0};
+    RT->Clear(&clear);
+    D2D1_MATRIX_3X2_F I = {};
+    I._11 = I._22 = 1;
+    RT->SetTransform(&I);
+
+    // header
+    txt(L"Orb", fTitle, U.pad, 20 * s, 120 * s, 32 * s, WA(0.96f));
+    txt(L"v" ORB_VERSION_W, fSmall, U.pad + 52 * s, 31 * s, 100 * s, 18 * s, WA(0.38f));
+    {
+        float cs = 32 * s, cx = w - U.pad - cs + 6 * s, cy = 20 * s;
+        bool hv = g_uiOpen && lx >= cx && lx < cx + cs && ly >= cy && ly < cy + cs;
+        float& ha = AN(500, 0, 0);
+        ease(ha, hv ? 1.f : 0.f, 14);
+        fEl(cx + cs / 2, cy + cs / 2, cs / 2, WA(0.06f + 0.10f * ha));
+        float k = 5 * s;
+        ln(cx + cs / 2 - k, cy + cs / 2 - k, cx + cs / 2 + k, cy + cs / 2 + k, WA(0.7f + 0.3f * ha), 1.6f * s);
+        ln(cx + cs / 2 + k, cy + cs / 2 - k, cx + cs / 2 - k, cy + cs / 2 + k, WA(0.7f + 0.3f * ha), 1.6f * s);
+        if (hv && g_mPressed) g_uiOpen = false;
+    }
+    ln(U.pad - 14 * s, headerH - 0.5f, w - U.pad + 14 * s, headerH - 0.5f, WA(0.07f), 1);
+
+    // scrolling content
+    D2D1_RECT_F clip = RC(0, headerH, w, h - headerH);
+    RT->PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_ALIASED);
+    D2D1_MATRIX_3X2_F T = I;
+    T._32 = headerH - g_scroll;
+    RT->SetTransform(&T);
+    U.y = 0;
+
+    uiSection(0, L"FORM");
+    uiForms();
+    if (uiToggle(L"Auto-morph between 3D forms", &S.autoMorph)) g_lastAuto = now();
+    uiSlider(P_MORPHSEC);
+
+    uiSection(1, L"COLOURS");
+    uiPalette();
+    uiSlider(P_HUE);
+
+    uiSection(2, L"CLOCK");
+    uiSegment(CLOCK_STYLES, 3, &S.clockStyle);
+    if (int dlt = uiCycle(L"Position", CLOCK_POS[S.clockPos])) { S.clockPos = (S.clockPos + dlt + 7) % 7; g_dirty = true; }
+    uiToggle(L"24-hour time", &S.h24);
+    uiToggle(L"Seconds", &S.seconds);
+    uiToggle(L"Date", &S.showDate);
+    uiToggle(L"Battery", &S.showBattery);
+    uiToggle(L"Now playing", &S.showMedia);
+    uiSlider(P_CLOCKSIZE);
+    uiSlider(P_FROST);
+    uiSlider(P_REFR);
+
+    uiSection(3, L"SHAPE & MOTION");
+    for (int i = P_SIZE; i <= P_BREATHE; i++) uiSlider(i);
+
+    uiSection(4, L"LOOK");
+    const int look[] = {P_BLOOM, P_PARTICLES, P_GLOW, P_GRAIN, P_ACCENT, P_BRIGHT, P_CONTRAST, P_STARS};
+    for (int i : look) uiSlider(i);
+
+    uiSection(5, L"SOUND");
+    uiToggle(L"React to what's playing", &S.audio);
+    uiSlider(P_SENS);
+
+    uiSection(6, L"DISPLAY");
+    uiToggle(L"Anti burn-in drift", &S.drift);
+    {
+        wchar_t fb[32];
+        if (S.fps > 0) swprintf(fb, 32, L"%d fps", S.fps);
+        else wcscpy(fb, L"Max (VSync)");
+        if (int dlt = uiCycle(L"Frame rate cap", fb)) {
+            int k = 0;
+            for (int i = 0; i < 4; i++) if (FPS_OPTS[i] == S.fps) k = i;
+            S.fps = FPS_OPTS[(k + dlt + 4) % 4];
+            g_dirty = true;
+        }
+    }
+    if (int dlt = uiCycle(L"Anti-aliasing", AA_NAMES[S.aa])) { S.aa = (S.aa + dlt + 3) % 3; g_dirty = true; }
+    uiSlider(P_SCALE);
+    int b = uiButtons2(g_fs ? L"Exit fullscreen" : L"Fullscreen", L"Reset all");
+    if (b == 1) toggleFullscreen();
+    if (b == 2) { defaults(); setForm(0, 1.6); g_dirty = true; }
+    uiEndSection();
+
+    U.y += 18 * s;
+    txt(g_statText, fSmall, U.pad, U.y, U.cw, 18 * s, WA(0.38f));
+    U.y += 22 * s;
+    txt(L"H settings  ·  F fullscreen  ·  1–7 forms  ·  M auto-morph\n"
+        L"C clock style  ·  A sound  ·  Space pause  ·  Esc close",
+        fSmall, U.pad, U.y, U.cw, 40 * s, WA(0.32f));
+    U.y += 46 * s;
+    g_contentH = U.y + 10 * s;
+
+    RT->SetTransform(&I);
+    RT->PopAxisAlignedClip();
+
+    // scrollbar + soft fade under the header
+    if (maxScroll > 1) {
+        float vh = h - headerH, bh = std::max(30 * s, vh * vh / g_contentH);
+        float by = headerH + (vh - bh) * (g_scroll / maxScroll);
+        fRR(w - 8 * s, by + 4 * s, 3 * s, bh - 8 * s, 1.5f * s, WA(inPanel ? 0.22f : 0.10f));
+    }
+    RT->EndDraw();
+    g_d2d->SetTarget(nullptr);
 }
 
 // ---------------------------------------------------------------- render
@@ -1018,6 +1950,26 @@ static void hueRotate(float* c, float a) {
     c[0] = clampf(r * m0 + g * m1 + b * m2, 0, 1);
     c[1] = clampf(r * m2 + g * m0 + b * m1, 0, 1);
     c[2] = clampf(r * m1 + g * m2 + b * m0, 0, 1);
+}
+
+static void fullPass(ID3D11RenderTargetView* rtv, int w, int h, ID3D11PixelShader* ps) {
+    ID3D11ShaderResourceView* nulls[4] = {};
+    g_ctx->OMSetRenderTargets(1, &rtv, NULL);
+    D3D11_VIEWPORT vp = {0, 0, (float)w, (float)h, 0, 1};
+    g_ctx->RSSetViewports(1, &vp);
+    g_ctx->PSSetShader(ps, NULL, 0);
+    (void)nulls;
+    g_ctx->Draw(4, 0);
+}
+static void setPost(float tx, float ty, float dx, float dy) {
+    PostCB p = {{tx, ty, dx, dy}, {0.32f, 0.45f, 0, 0}};
+    g_ctx->UpdateSubresource(g_cbPost, 0, NULL, &p, 0, 0);
+}
+static void bindSRVs(ID3D11ShaderResourceView* a, ID3D11ShaderResourceView* b, ID3D11ShaderResourceView* c, ID3D11ShaderResourceView* d) {
+    ID3D11ShaderResourceView* nulls[4] = {};
+    g_ctx->PSSetShaderResources(0, 4, nulls);  // never leave a target bound as input
+    ID3D11ShaderResourceView* s[4] = {a, b, c, d};
+    g_ctx->PSSetShaderResources(0, 4, s);
 }
 
 static void render() {
@@ -1035,15 +1987,26 @@ static void render() {
     g_lastT = tn;
     double real = tn - g_t0;
     audioUpdate(tn, dt);
+    updatePower(tn);
+    mediaUpdate(tn);
     updateMorph(tn);
     if (!g_paused) g_simT += dt * S.p[P_SPEED] * (1.0 + 1.2 * A.level);
+
+    // settings panel first: Direct2D shares the device context, and everything below sets its own state
+    U.dt = dt;
+    ease(g_uiT, g_uiOpen ? 1.f : 0.f, g_uiOpen ? 9.f : 12.f);
+    if (g_uiT > 0.002f) drawUi(dt);
+    g_mPressed = false;
+    g_wheel = 0;
 
     float offX = 0, offY = 0;
     if (S.drift) {
         offX = (float)(sin(real * 0.021) * 0.07);
         offY = (float)(sin(real * 0.029 + 1.3) * 0.05);
     }
-    int vw = std::max(1, (int)(g_bbW * S.p[P_SCALE])), vh = std::max(1, (int)(g_bbH * S.p[P_SCALE]));
+    // supersampling: render the scene bigger; the composite's bilinear fetch averages it back down
+    float rs = S.p[P_SCALE] * AA_FACTOR[S.aa];
+    int vw = std::min(16384, std::max(1, (int)(g_bbW * rs))), vh = std::min(16384, std::max(1, (int)(g_bbH * rs)));
 
     OrbCB cb = {};
     cb.res[0] = (float)vw;
@@ -1066,6 +2029,9 @@ static void render() {
     cb.formB = g_formB;
     cb.bass = A.bass;
     cb.level = A.level;
+    cb.particles = S.p[P_PARTICLES];
+    cb.ss = (float)vh / (float)g_bbH;
+    cb.charge = g_charging ?(float)(0.5 + 0.5 * sin(real * 1.4)) : 0.f;
     float hue = (float)fmod(real * S.p[P_HUE] * 0.25, 6.283185307);
     for (int i = 0; i < 4; i++) {
         cb.c[i][0] = GetRValue(S.c[i]) / 255.f;
@@ -1076,31 +2042,55 @@ static void render() {
     }
     g_ctx->UpdateSubresource(g_cbOrb, 0, NULL, &cb, 0, 0);
 
-    ID3D11ShaderResourceView* nulls[2] = {nullptr, nullptr};
-    g_ctx->PSSetShaderResources(0, 2, nulls);
     g_ctx->IASetInputLayout(NULL);
     g_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
     g_ctx->RSSetState(g_rast);
+    g_ctx->OMSetBlendState(NULL, NULL, 0xffffffff);
+    g_ctx->OMSetDepthStencilState(NULL, 0);
     g_ctx->VSSetShader(g_vs, NULL, 0);
     g_ctx->PSSetSamplers(0, 1, &g_samp);
-    g_ctx->PSSetConstantBuffers(0, 1, &g_cbOrb);
-    g_ctx->PSSetConstantBuffers(1, 1, &g_cbComp);
+    ID3D11Buffer* cbs[3] = {g_cbOrb, g_cbComp, g_cbPost};
+    g_ctx->PSSetConstantBuffers(0, 3, cbs);
 
     // 1) scene at render resolution
-    ensureSceneTarget(vw, vh);
-    g_ctx->OMSetRenderTargets(1, &g_sceneRtv, NULL);
-    D3D11_VIEWPORT vp = {0, 0, (float)vw, (float)vh, 0, 1};
-    g_ctx->RSSetViewports(1, &vp);
-    g_ctx->PSSetShader(g_psScene, NULL, 0);
-    g_ctx->Draw(4, 0);
+    ensureTarget(g_scene, vw, vh);
+    bindSRVs(nullptr, nullptr, nullptr, nullptr);
+    fullPass(g_scene.rtv, vw, vh, g_psScene);
 
-    // 2) composite at full resolution: upscale + clock
+    // 2) bloom: bright pass at 1/4 resolution, then two separable blur rounds
+    float bloom = S.p[P_BLOOM];
+    if (bloom > 0.001f) {
+        int bw = std::max(1, vw / 4), bh = std::max(1, vh / 4);
+        ensureTarget(g_bloomA, bw, bh);
+        ensureTarget(g_bloomB, bw, bh);
+        setPost(1.f / vw, 1.f / vh, 0, 0);
+        bindSRVs(g_scene.srv, nullptr, nullptr, nullptr);
+        fullPass(g_bloomA.rtv, bw, bh, g_psBright);
+        for (int it = 0; it < 2; it++) {
+            float sp = it == 0 ? 1.2f : 2.6f;
+            setPost(1.f / bw, 1.f / bh, sp, 0);
+            bindSRVs(nullptr, nullptr, g_bloomA.srv, nullptr);
+            fullPass(g_bloomB.rtv, bw, bh, g_psBlur);
+            setPost(1.f / bw, 1.f / bh, 0, sp);
+            bindSRVs(nullptr, nullptr, g_bloomB.srv, nullptr);
+            fullPass(g_bloomA.rtv, bw, bh, g_psBlur);
+        }
+    }
+
+    // 3) composite at full resolution
     CompCB cc = {};
     float H = (float)g_bbH, W = (float)g_bbW, k1 = H / 1440.f;
     cc.misc[0] = W;
     cc.misc[1] = H;
     cc.misc[2] = 0.95f;
     cc.misc[3] = k1;
+    cc.audio[0] = A.bass;
+    cc.audio[1] = A.level;
+    cc.audio[2] = bloom > 0.001f ? bloom : 0.f;
+    cc.audio[3] = g_uiT > 0.002f ? std::min(1.f, g_uiT * 1.3f) : 0.f;
+    for (int i = 0; i < 4; i++) cc.ui[i] = g_uiRect[i];
+    cc.ui2[0] = 26 * k1 * 1.333f;
+    cc.ui2[1] = 30 * k1;
     if (S.clockStyle > 0) {
         updateClockTexture();
         float th = (float)g_textTh;
@@ -1128,14 +2118,9 @@ static void render() {
         cc.text[3] = (float)g_textH;
     }
     g_ctx->UpdateSubresource(g_cbComp, 0, NULL, &cc, 0, 0);
-    g_ctx->OMSetRenderTargets(1, &g_rtv, NULL);
-    vp.Width = W;
-    vp.Height = H;
-    g_ctx->RSSetViewports(1, &vp);
-    ID3D11ShaderResourceView* srvs[2] = {g_sceneSrv, S.clockStyle > 0 ? g_textSrv : nullptr};
-    g_ctx->PSSetShaderResources(0, 2, srvs);
-    g_ctx->PSSetShader(g_psComp, NULL, 0);
-    g_ctx->Draw(4, 0);
+    bindSRVs(g_scene.srv, S.clockStyle > 0 ? g_textSrv : nullptr, bloom > 0.001f ? g_bloomA.srv : nullptr,
+             cc.audio[3] > 0 ? g_ui.srv : nullptr);
+    fullPass(g_rtv, g_bbW, g_bbH, g_psComp);
 
     HRESULT hr = g_sc->Present(1, 0);
     if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
@@ -1150,400 +2135,44 @@ static void render() {
     g_frames++;
     if (tn - g_fpsT >= 1.0) {
         wchar_t b[160];
-        swprintf(b, 160, L"%d fps  ·  %d×%d px%ls\n%ls", g_frames, vw, vh, g_paused ? L"  ·  paused" : L"",
-                 S.audio ? (A.client ? L"Sound: listening" : L"Sound: no audio device") : L"");
-        if (g_stat) SetWindowTextW(g_stat, b);
+        swprintf(b, 160, L"%d fps  ·  %d×%d%ls%ls", g_frames, vw, vh, g_paused ? L"  ·  paused" : L"",
+                 S.audio ? (A.client ? L"  ·  listening" : L"  ·  no audio device") : L"");
+        g_statText = b;
         g_frames = 0;
         g_fpsT = tn;
     }
-}
 
-// ---------------------------------------------------------------- fullscreen
-static void toggleFullscreen() {
-    DWORD style = (DWORD)GetWindowLongPtrW(g_main, GWL_STYLE);
-    if (!g_fs) {
-        MONITORINFO mi = {sizeof mi};
-        if (GetWindowPlacement(g_main, &g_wpPrev) &&
-            GetMonitorInfoW(MonitorFromWindow(g_main, MONITOR_DEFAULTTONEAREST), &mi)) {
-            SetWindowLongPtrW(g_main, GWL_STYLE, (style & ~WS_OVERLAPPEDWINDOW) | WS_POPUP);
-            SetWindowPos(g_main, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
-                         mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top,
-                         SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
-            g_fs = true;
-        }
-    } else {
-        SetWindowLongPtrW(g_main, GWL_STYLE, (style & ~WS_POPUP) | WS_OVERLAPPEDWINDOW);
-        SetWindowPlacement(g_main, &g_wpPrev);
-        SetWindowPos(g_main, NULL, 0, 0, 0, 0,
-                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
-        g_fs = false;
+    if (g_pendingColor >= 0) {  // modal dialog: open it only after the frame is finished
+        int i = g_pendingColor;
+        g_pendingColor = -1;
+        pickColor(i);
+        g_mDown = false;
+        g_lastT = now();
     }
-    g_dirty = true;
-}
-
-// ---------------------------------------------------------------- save
-static void saveSettings() {
-    for (int i = 0; i < NP; i++) iniWF(L"orb", PD[i].key, S.p[i]);
-    for (int i = 0; i < 4; i++) {
-        wchar_t key[8], b[16];
-        swprintf(key, 8, L"c%d", i);
-        swprintf(b, 16, L"#%02x%02x%02x", GetRValue(S.c[i]), GetGValue(S.c[i]), GetBValue(S.c[i]));
-        WritePrivateProfileStringW(L"orb", key, b, g_ini.c_str());
-    }
-    iniWF(L"orb", L"drift", S.drift);
-    iniWF(L"orb", L"automorph", S.autoMorph);
-    iniWF(L"orb", L"h24", S.h24);
-    iniWF(L"orb", L"seconds", S.seconds);
-    iniWF(L"orb", L"date", S.showDate);
-    iniWF(L"orb", L"audio", S.audio);
-    iniWF(L"orb", L"fps", S.fps);
-    iniWF(L"orb", L"form", S.form);
-    iniWF(L"orb", L"clockstyle", S.clockStyle);
-    iniWF(L"orb", L"clockpos", S.clockPos);
-
-    if (g_main) {
-        WINDOWPLACEMENT wp = {sizeof wp};
-        if (g_fs) wp = g_wpPrev;
-        else GetWindowPlacement(g_main, &wp);
-        RECT& r = wp.rcNormalPosition;
-        iniWF(L"window", L"x", r.left);
-        iniWF(L"window", L"y", r.top);
-        iniWF(L"window", L"w", r.right - r.left);
-        iniWF(L"window", L"h", r.bottom - r.top);
-        iniWF(L"window", L"fullscreen", g_fs);
-    }
-    g_dirty = false;
-}
-
-// ---------------------------------------------------------------- settings window
-enum {
-    ID_PRESET0 = 100, ID_COLOR0 = 110,
-    ID_DRIFT = 120, ID_FPS, ID_FULL, ID_RESET,
-    ID_FORM0 = 130, ID_AUTOMORPH = 140,
-    ID_CSTYLE0 = 150, ID_CPOS = 155, ID_H24, ID_SECS, ID_DATE,
-    ID_AUDIO = 160,
-    ID_TRACK0 = 200, ID_VAL0 = 300, ID_LABEL0 = 400, ID_HDR = 900, ID_STAT = 950, ID_HINT
-};
-static const COLORREF UI_BG = RGB(12, 16, 24), UI_FG = RGB(223, 232, 245), UI_DIM = RGB(125, 138, 160),
-                      UI_LINE = RGB(44, 52, 68), UI_BTN = RGB(22, 28, 40), UI_ACC = RGB(74, 168, 255),
-                      UI_SEL = RGB(20, 44, 74);
-static HBRUSH g_brBg;
-static HFONT g_fUI, g_fHdr, g_fSmall;
-static int g_setDpi = 96;
-static const int SET_W = 900, SET_H = 512;
-
-static int D(int v) { return MulDiv(v, g_setDpi, 96); }
-
-static bool* toggleOf(int id) {
-    switch (id) {
-    case ID_DRIFT: return &S.drift;
-    case ID_AUTOMORPH: return &S.autoMorph;
-    case ID_H24: return &S.h24;
-    case ID_SECS: return &S.seconds;
-    case ID_DATE: return &S.showDate;
-    case ID_AUDIO: return &S.audio;
-    }
-    return nullptr;
-}
-
-static void makeFonts() {
-    if (g_fUI) DeleteObject(g_fUI);
-    if (g_fHdr) DeleteObject(g_fHdr);
-    if (g_fSmall) DeleteObject(g_fSmall);
-    auto mk = [](int pt10, int weight) {
-        return CreateFontW(-MulDiv(pt10, g_setDpi, 720), 0, 0, 0, weight, 0, 0, 0, DEFAULT_CHARSET, OUT_TT_PRECIS,
-                           CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
-    };
-    g_fUI = mk(90, FW_NORMAL);
-    g_fHdr = mk(75, FW_SEMIBOLD);
-    g_fSmall = mk(80, FW_NORMAL);
-}
-
-static HWND child(const wchar_t* cls, const wchar_t* text, DWORD style, int x, int y, int w, int h, int id, HFONT f) {
-    HWND c = CreateWindowExW(0, cls, text, WS_CHILD | WS_VISIBLE | style, D(x), D(y), D(w), D(h), g_set,
-                             (HMENU)(INT_PTR)id, g_inst, NULL);
-    SendMessageW(c, WM_SETFONT, (WPARAM)f, TRUE);
-    return c;
-}
-static HWND label(const wchar_t* text, DWORD style, int x, int y, int w, int h, int id, HFONT f) {
-    return child(L"STATIC", text, style | SS_NOPREFIX, x, y, w, h, id, f);
-}
-static HWND button(const wchar_t* text, int x, int y, int w, int h, int id, HFONT f) {
-    return child(L"BUTTON", text, BS_OWNERDRAW | WS_TABSTOP, x, y, w, h, id, f);
-}
-
-static void setValText(int i) {
-    wchar_t b[32];
-    if (PD[i].fmt == FMT_PCT) swprintf(b, 32, L"%d%%", (int)lroundf(S.p[i] * 100));
-    else if (PD[i].fmt == FMT_SEC) swprintf(b, 32, L"%d s", (int)lroundf(S.p[i]));
-    else swprintf(b, 32, L"%.2f", S.p[i]);
-    SetWindowTextW(g_val[i], b);
-}
-
-static void syncControls() {
-    if (!g_set) return;
-    for (int i = 0; i < NP; i++) {
-        int pos = (int)lroundf((S.p[i] - PD[i].mn) / (PD[i].mx - PD[i].mn) * 1000.f);
-        SendMessageW(g_track[i], TBM_SETPOS, TRUE, pos);
-        setValText(i);
-    }
-    for (HWND c = GetWindow(g_set, GW_CHILD); c; c = GetWindow(c, GW_HWNDNEXT))
-        if (GetDlgCtrlID(c) < ID_TRACK0) InvalidateRect(c, NULL, FALSE);
-}
-
-static void sliderRow(int i, int x, int y, int w) {
-    label(PD[i].label, SS_LEFT, x, y + 4, 104, 20, ID_LABEL0 + i, g_fUI);
-    g_track[i] = child(TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_NOTICKS | WS_TABSTOP, x + 100, y, w - 100 - 46, 26,
-                       ID_TRACK0 + i, g_fUI);
-    SendMessageW(g_track[i], TBM_SETRANGE, TRUE, MAKELPARAM(0, 1000));
-    SendMessageW(g_track[i], TBM_SETLINESIZE, 0, 10);
-    SendMessageW(g_track[i], TBM_SETPAGESIZE, 0, 50);
-    g_val[i] = label(L"", SS_RIGHT, x + w - 46, y + 4, 46, 20, ID_VAL0 + i, g_fSmall);
-}
-
-static void buildSettings() {
-    for (HWND c; (c = GetWindow(g_set, GW_CHILD));) DestroyWindow(c);
-    makeFonts();
-
-    // column 1: palette, form, screen
-    const int x = 16, W = 262;
-    label(L"PALETTE", 0, x, 12, W, 16, ID_HDR, g_fHdr);
-    for (int i = 0; i < 6; i++) button(PRESETS[i].name, x + (i % 3) * 88, 32 + (i / 3) * 50, 82, 44, ID_PRESET0 + i, g_fSmall);
-    for (int i = 0; i < 4; i++) button(COLOR_NAMES[i], x + i * 66, 134, 60, 40, ID_COLOR0 + i, g_fSmall);
-    sliderRow(P_HUE, x, 182, W);
-    label(L"FORM", 0, x, 222, W, 16, ID_HDR, g_fHdr);
-    for (int i = 0; i < 4; i++) button(FORM_NAMES[i], x + i * 67, 242, 61, 32, ID_FORM0 + i, g_fUI);
-    for (int i = 4; i < 7; i++) button(FORM_NAMES[i], x + (i - 4) * 89, 280, 84, 32, ID_FORM0 + i, g_fUI);
-    button(L"Auto-morph between 3D forms", x, 320, W, 24, ID_AUTOMORPH, g_fUI);
-    sliderRow(P_MORPHSEC, x, 348, W);
-    label(L"SCREEN & PERFORMANCE", 0, x, 388, W, 16, ID_HDR, g_fHdr);
-    button(L"Anti burn-in drift", x, 408, W, 24, ID_DRIFT, g_fUI);
-    button(L"", x, 436, W, 28, ID_FPS, g_fUI);
-    sliderRow(P_SCALE, x, 472, W);
-
-    // column 2: shape + look
-    const int x2 = 310, W2 = 280;
-    label(L"SHAPE & MOTION", 0, x2, 12, W2, 16, ID_HDR, g_fHdr);
-    for (int i = P_SIZE; i <= P_BREATHE; i++) sliderRow(i, x2, 32 + (i - P_SIZE) * 30, W2);
-    label(L"LOOK", 0, x2, 222, W2, 16, ID_HDR, g_fHdr);
-    for (int i = P_GRAIN; i <= P_STARS; i++) sliderRow(i, x2, 242 + (i - P_GRAIN) * 30, W2);
-    button(L"Fullscreen", x2, 432, 137, 30, ID_FULL, g_fUI);
-    button(L"Reset all", x2 + 143, 432, 137, 30, ID_RESET, g_fUI);
-    g_stat = label(L"", 0, x2, 470, W2, 36, ID_STAT, g_fSmall);
-
-    // column 3: clock + audio
-    const int x3 = 610, W3 = 274;
-    label(L"CLOCK", 0, x3, 12, W3, 16, ID_HDR, g_fHdr);
-    for (int i = 0; i < 3; i++) button(CLOCK_STYLES[i], x3 + i * 93, 32, 88, 28, ID_CSTYLE0 + i, g_fUI);
-    button(L"", x3, 66, W3, 28, ID_CPOS, g_fUI);
-    button(L"24-hour time", x3, 100, W3, 24, ID_H24, g_fUI);
-    button(L"Show seconds", x3, 126, W3, 24, ID_SECS, g_fUI);
-    button(L"Show date", x3, 152, W3, 24, ID_DATE, g_fUI);
-    sliderRow(P_CLOCKSIZE, x3, 180, W3);
-    sliderRow(P_FROST, x3, 210, W3);
-    sliderRow(P_REFR, x3, 240, W3);
-    label(L"SOUND", 0, x3, 282, W3, 16, ID_HDR, g_fHdr);
-    button(L"React to what's playing", x3, 302, W3, 24, ID_AUDIO, g_fUI);
-    sliderRow(P_SENS, x3, 330, W3);
-    label(L"KEYS\nH  settings     F / F11  fullscreen\n1–7  forms     M  auto-morph\n"
-          L"C  clock style     A  sound     Space  pause\nRight-click the orb to open this panel",
-          0, x3, 380, W3, 110, ID_HINT, g_fSmall);
-
-    syncControls();
-}
-
-static void sizeSettingsWindow(const RECT* at) {
-    RECT r = {0, 0, D(SET_W), D(SET_H)};
-    DWORD st = (DWORD)GetWindowLongPtrW(g_set, GWL_STYLE), ex = (DWORD)GetWindowLongPtrW(g_set, GWL_EXSTYLE);
-    AdjustWindowRectExForDpi(&r, st, FALSE, ex, g_setDpi);
-    if (at) SetWindowPos(g_set, NULL, at->left, at->top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
-    else SetWindowPos(g_set, NULL, 0, 0, r.right - r.left, r.bottom - r.top, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
-}
-
-static void showSettings(bool show) {
-    if (!show) {
-        ShowWindow(g_set, SW_HIDE);
-        SetForegroundWindow(g_main);
-        return;
-    }
-    MONITORINFO mi = {sizeof mi};
-    GetMonitorInfoW(MonitorFromWindow(g_main, MONITOR_DEFAULTTONEAREST), &mi);
-    SetWindowPos(g_set, NULL, mi.rcWork.left + 40, mi.rcWork.top + 40, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-    RECT r;
-    GetWindowRect(g_set, &r);
-    SetWindowPos(g_set, NULL, mi.rcWork.right - (r.right - r.left) - 24, mi.rcWork.top + 24, 0, 0,
-                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-    ShowWindow(g_set, SW_SHOW);
-    SetForegroundWindow(g_set);
-}
-
-static void fillRound(HDC dc, const RECT& r, COLORREF fill, COLORREF border, int rad) {
-    HGDIOBJ ob = SelectObject(dc, GetStockObject(DC_BRUSH));
-    HGDIOBJ op = SelectObject(dc, GetStockObject(DC_PEN));
-    SetDCBrushColor(dc, fill);
-    SetDCPenColor(dc, border);
-    RoundRect(dc, r.left, r.top, r.right, r.bottom, rad, rad);
-    SelectObject(dc, ob);
-    SelectObject(dc, op);
-}
-
-static COLORREF lerpC(COLORREF a, COLORREF b, float t) {
-    return RGB(GetRValue(a) + (GetRValue(b) - GetRValue(a)) * t, GetGValue(a) + (GetGValue(b) - GetGValue(a)) * t,
-               GetBValue(a) + (GetBValue(b) - GetBValue(a)) * t);
-}
-
-static void drawItem(DRAWITEMSTRUCT* di) {
-    HDC dc = di->hDC;
-    RECT r = di->rcItem;
-    int id = (int)di->CtlID;
-    bool pressed = (di->itemState & ODS_SELECTED) != 0;
-    bool focus = (di->itemState & ODS_FOCUS) != 0 && !(di->itemState & ODS_NOFOCUSRECT);
-    wchar_t text[128];
-    GetWindowTextW(di->hwndItem, text, 128);
-    HBRUSH bg = CreateSolidBrush(UI_BG);
-    FillRect(dc, &r, bg);
-    DeleteObject(bg);
-    SetBkMode(dc, TRANSPARENT);
-    SelectObject(dc, (HFONT)SendMessageW(di->hwndItem, WM_GETFONT, 0, 0));
-    int rad = D(10);
-    const UINT DT = DT_NOPREFIX | DT_SINGLELINE | DT_VCENTER;
-
-    if (id >= ID_PRESET0 && id < ID_PRESET0 + 6) {
-        const Preset& p = PRESETS[id - ID_PRESET0];
-        bool on = true;
-        for (int i = 0; i < 4; i++) on = on && p.c[i] == S.c[i];
-        fillRound(dc, r, pressed ? UI_LINE : UI_BTN, on ? UI_ACC : (focus ? UI_DIM : UI_LINE), rad);
-        RECT g = {r.left + D(7), r.top + D(7), r.right - D(7), r.top + D(21)};
-        int w = g.right - g.left;
-        for (int x = 0; x < w; x++) {
-            float t = (float)x / (w - 1) * 3.f;
-            int seg = std::min(2, (int)t);
-            RECT l = {g.left + x, g.top, g.left + x + 1, g.bottom};
-            HBRUSH b = CreateSolidBrush(lerpC(p.c[seg], p.c[seg + 1], t - seg));
-            FillRect(dc, &l, b);
-            DeleteObject(b);
-        }
-        RECT tr = {r.left, g.bottom + D(2), r.right, r.bottom - D(2)};
-        SetTextColor(dc, UI_FG);
-        DrawTextW(dc, text, -1, &tr, DT | DT_CENTER);
-    } else if (id >= ID_COLOR0 && id < ID_COLOR0 + 4) {
-        COLORREF c = S.c[id - ID_COLOR0];
-        fillRound(dc, r, c, pressed || focus ? UI_ACC : UI_LINE, rad);
-        int lum = (GetRValue(c) * 299 + GetGValue(c) * 587 + GetBValue(c) * 114) / 1000;
-        SetTextColor(dc, lum > 140 ? RGB(10, 14, 20) : UI_FG);
-        DrawTextW(dc, text, -1, &r, DT | DT_CENTER);
-    } else if (bool* tg = toggleOf(id)) {
-        bool on = *tg;
-        int bs = D(16);
-        RECT b = {r.left + D(1), r.top + (r.bottom - r.top - bs) / 2, r.left + D(1) + bs, r.top + (r.bottom - r.top + bs) / 2};
-        fillRound(dc, b, on ? UI_ACC : UI_BTN, on ? UI_ACC : (focus ? UI_DIM : UI_LINE), D(5));
-        if (on) {
-            HPEN pen = CreatePen(PS_SOLID, std::max(2, D(2)), RGB(8, 20, 40));
-            HGDIOBJ op = SelectObject(dc, pen);
-            MoveToEx(dc, b.left + bs * 25 / 100, b.top + bs * 52 / 100, NULL);
-            LineTo(dc, b.left + bs * 43 / 100, b.top + bs * 70 / 100);
-            LineTo(dc, b.left + bs * 76 / 100, b.top + bs * 32 / 100);
-            SelectObject(dc, op);
-            DeleteObject(pen);
-        }
-        RECT tr = {b.right + D(10), r.top, r.right, r.bottom};
-        SetTextColor(dc, UI_FG);
-        DrawTextW(dc, text, -1, &tr, DT | DT_LEFT);
-    } else {
-        bool sel = (id >= ID_FORM0 && id < ID_FORM0 + NUM_FORMS && S.form == id - ID_FORM0) ||
-                   (id >= ID_CSTYLE0 && id < ID_CSTYLE0 + 3 && S.clockStyle == id - ID_CSTYLE0);
-        fillRound(dc, r, pressed ? UI_LINE : (sel ? UI_SEL : UI_BTN), sel ? UI_ACC : (focus ? UI_DIM : UI_LINE), rad);
-        if (id == ID_FPS) {
-            if (S.fps > 0) swprintf(text, 128, L"FPS cap:  %d", S.fps);
-            else swprintf(text, 128, L"FPS cap:  Max / VSync");
-        } else if (id == ID_CPOS) {
-            swprintf(text, 128, L"Position:  %ls", CLOCK_POS[S.clockPos]);
-        } else if (id == ID_FULL) {
-            wcscpy(text, g_fs ? L"Exit fullscreen" : L"Fullscreen");
-        }
-        SetTextColor(dc, sel ? RGB(255, 255, 255) : UI_FG);
-        DrawTextW(dc, text, -1, &r, DT | DT_CENTER);
-    }
-}
-
-static void pickColor(int i) {
-    static COLORREF custom[16];
-    CHOOSECOLORW cc = {sizeof cc};
-    cc.hwndOwner = g_set;
-    cc.rgbResult = S.c[i];
-    cc.lpCustColors = custom;
-    cc.Flags = CC_FULLOPEN | CC_RGBINIT | CC_ANYCOLOR;
-    if (ChooseColorW(&cc)) {
-        S.c[i] = cc.rgbResult;
-        g_dirty = true;
-        syncControls();
-    }
-}
-
-static LRESULT CALLBACK SetProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
-    switch (m) {
-    case WM_CTLCOLORSTATIC: {
-        HDC dc = (HDC)wp;
-        int id = GetDlgCtrlID((HWND)lp);
-        SetTextColor(dc, (id >= ID_HDR || (id >= ID_VAL0 && id < ID_LABEL0)) ? UI_DIM : UI_FG);
-        SetBkColor(dc, UI_BG);
-        return (LRESULT)g_brBg;
-    }
-    case WM_DRAWITEM:
-        drawItem((DRAWITEMSTRUCT*)lp);
-        return TRUE;
-    case WM_HSCROLL:
-        for (int i = 0; i < NP; i++)
-            if ((HWND)lp == g_track[i]) {
-                int pos = (int)SendMessageW(g_track[i], TBM_GETPOS, 0, 0);
-                S.p[i] = PD[i].mn + (PD[i].mx - PD[i].mn) * pos / 1000.f;
-                setValText(i);
-                g_dirty = true;
-            }
-        return 0;
-    case WM_COMMAND: {
-        int id = LOWORD(wp), code = HIWORD(wp);
-        if (code != BN_CLICKED && code != BN_DOUBLECLICKED) break;
-        if (id >= ID_PRESET0 && id < ID_PRESET0 + 6) {
-            for (int i = 0; i < 4; i++) S.c[i] = PRESETS[id - ID_PRESET0].c[i];
-        } else if (id >= ID_COLOR0 && id < ID_COLOR0 + 4) {
-            pickColor(id - ID_COLOR0);
-            return 0;
-        } else if (id >= ID_FORM0 && id < ID_FORM0 + NUM_FORMS) {
-            setForm(id - ID_FORM0, 1.6);
-        } else if (id >= ID_CSTYLE0 && id < ID_CSTYLE0 + 3) {
-            S.clockStyle = id - ID_CSTYLE0;
-        } else if (bool* tg = toggleOf(id)) {
-            *tg = !*tg;
-            if (id == ID_AUTOMORPH) g_lastAuto = now();
-        } else if (id == ID_CPOS) {
-            S.clockPos = (S.clockPos + 1) % 7;
-        } else if (id == ID_FPS) {
-            int k = 0;
-            for (int i = 0; i < 4; i++) if (FPS_OPTS[i] == S.fps) k = i;
-            S.fps = FPS_OPTS[(k + 1) % 4];
-        } else if (id == ID_FULL) toggleFullscreen();
-        else if (id == ID_RESET) { defaults(); setForm(0, 1.6); }
-        else break;
-        g_dirty = true;
-        syncControls();
-        return 0;
-    }
-    case WM_DPICHANGED:
-        g_setDpi = HIWORD(wp);
-        buildSettings();
-        sizeSettingsWindow((RECT*)lp);
-        return 0;
-    case WM_CLOSE:
-        showSettings(false);
-        return 0;
-    case WM_ENTERSIZEMOVE: SetTimer(g_main, 1, 15, NULL); return 0;
-    case WM_EXITSIZEMOVE: KillTimer(g_main, 1); return 0;
-    }
-    return DefWindowProcW(h, m, wp, lp);
 }
 
 // ---------------------------------------------------------------- main window
+static bool overPanel(float x, float y) {
+    return g_uiOpen && x >= g_uiRect[0] && y >= g_uiRect[1] && x < g_uiRect[0] + g_uiRect[2] && y < g_uiRect[1] + g_uiRect[3];
+}
+
+static void handleKey(WPARAM k) {
+    if (k >= '1' && k < '1' + NUM_FORMS) { setForm((int)(k - '1'), 1.6); return; }
+    if (k >= VK_NUMPAD1 && k < VK_NUMPAD1 + NUM_FORMS) { setForm((int)(k - VK_NUMPAD1), 1.6); return; }
+    switch (k) {
+    case 'H': g_uiOpen = !g_uiOpen; break;
+    case 'F': case VK_F11: toggleFullscreen(); break;
+    case 'M': S.autoMorph = !S.autoMorph; g_lastAuto = now(); g_dirty = true; break;
+    case 'C': S.clockStyle = (S.clockStyle + 1) % 3; g_dirty = true; break;
+    case 'A': S.audio = !S.audio; g_dirty = true; break;
+    case VK_SPACE: g_paused = !g_paused; break;
+    case VK_ESCAPE:
+        if (g_uiOpen) g_uiOpen = false;
+        else if (g_fs) toggleFullscreen();
+        break;
+    }
+}
+
 static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     switch (m) {
     case WM_SIZE:
@@ -1557,18 +2186,41 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     case WM_PAINT:
         ValidateRect(h, NULL);
         return 0;
-    case WM_LBUTTONDBLCLK:
-        toggleFullscreen();
-        syncControls();
+    case WM_KEYDOWN:
+        handleKey(wp);
+        return 0;
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONDBLCLK: {
+        float x = (short)LOWORD(lp), y = (short)HIWORD(lp);
+        g_mx = x; g_my = y;
+        if (overPanel(x, y)) {
+            g_mDown = true;
+            g_mPressed = true;
+            SetCapture(h);
+        } else if (g_uiOpen) {
+            g_uiOpen = false;                       // click on the orb closes the panel
+        } else if (m == WM_LBUTTONDBLCLK) {
+            toggleFullscreen();
+        }
+        return 0;
+    }
+    case WM_LBUTTONUP:
+        g_mDown = false;
+        ReleaseCapture();
+        return 0;
+    case WM_MOUSEWHEEL:
+        g_wheel += GET_WHEEL_DELTA_WPARAM(wp);
         return 0;
     case WM_RBUTTONUP:
-        showSettings(!IsWindowVisible(g_set));
+        g_uiOpen = !g_uiOpen;
         return 0;
     case WM_SYSKEYDOWN:
-        if (wp == VK_RETURN) { toggleFullscreen(); syncControls(); return 0; }
+        if (wp == VK_RETURN) { toggleFullscreen(); return 0; }
         break;
     case WM_MOUSEMOVE: {
         POINT pt = {(short)LOWORD(lp), (short)HIWORD(lp)};
+        g_mx = (float)pt.x;
+        g_my = (float)pt.y;
         if (pt.x != g_lastMouse.x || pt.y != g_lastMouse.y) {
             g_lastMouse = pt;
             g_lastMove = now();
@@ -1604,27 +2256,6 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(h, m, wp, lp);
 }
 
-static bool handleHotkey(const MSG& msg) {
-    if (msg.message != WM_KEYDOWN) return false;
-    if (msg.hwnd != g_main && msg.hwnd != g_set && GetParent(msg.hwnd) != g_set) return false;
-    WPARAM k = msg.wParam;
-    if (k >= '1' && k < '1' + NUM_FORMS) { setForm((int)(k - '1'), 1.6); syncControls(); return true; }
-    if (k >= VK_NUMPAD1 && k < VK_NUMPAD1 + NUM_FORMS) { setForm((int)(k - VK_NUMPAD1), 1.6); syncControls(); return true; }
-    switch (k) {
-    case 'H': showSettings(!IsWindowVisible(g_set)); return true;
-    case 'F': case VK_F11: toggleFullscreen(); syncControls(); return true;
-    case 'M': S.autoMorph = !S.autoMorph; g_lastAuto = now(); g_dirty = true; syncControls(); return true;
-    case 'C': S.clockStyle = (S.clockStyle + 1) % 3; g_dirty = true; syncControls(); return true;
-    case 'A': S.audio = !S.audio; g_dirty = true; syncControls(); return true;
-    case VK_SPACE: g_paused = !g_paused; return true;
-    case VK_ESCAPE:
-        if (IsWindowVisible(g_set)) showSettings(false);
-        else if (g_fs) { toggleFullscreen(); syncControls(); }
-        return true;
-    }
-    return false;
-}
-
 static void darkTitle(HWND h) {
     BOOL on = TRUE;
     DwmSetWindowAttribute(h, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */, &on, sizeof on);
@@ -1637,9 +2268,6 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int) {
     timeBeginPeriod(1);
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
 
-    INITCOMMONCONTROLSEX icc = {sizeof icc, ICC_BAR_CLASSES};
-    InitCommonControlsEx(&icc);
-
     bool hadIni = loadSettings();
     g_formA = g_formB = S.form;
     g_lastAuto = now();
@@ -1647,7 +2275,6 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int) {
     HICON icon = (HICON)LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON, 0, 0, LR_DEFAULTSIZE);
     HICON iconSm = (HICON)LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON),
                                      GetSystemMetrics(SM_CYSMICON), 0);
-
     WNDCLASSEXW wc = {sizeof wc};
     wc.style = CS_DBLCLKS;
     wc.lpfnWndProc = MainProc;
@@ -1658,17 +2285,6 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int) {
     wc.lpszClassName = L"OrbMain";
     RegisterClassExW(&wc);
 
-    g_brBg = CreateSolidBrush(UI_BG);
-    WNDCLASSEXW sc = {sizeof sc};
-    sc.lpfnWndProc = SetProc;
-    sc.hInstance = inst;
-    sc.hIcon = icon;
-    sc.hIconSm = iconSm;
-    sc.hCursor = LoadCursor(NULL, IDC_ARROW);
-    sc.hbrBackground = g_brBg;
-    sc.lpszClassName = L"OrbSettings";
-    RegisterClassExW(&sc);
-
     g_main = CreateWindowExW(0, L"OrbMain", L"Orb", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 1280, 760,
                              NULL, NULL, inst, NULL);
     if (!g_main || !initD3D(g_main)) {
@@ -1676,13 +2292,6 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int) {
         return 1;
     }
     darkTitle(g_main);
-
-    g_set = CreateWindowExW(WS_EX_TOOLWINDOW, L"OrbSettings", L"Orb settings  ·  v" ORB_VERSION_W, WS_CAPTION | WS_SYSMENU | WS_POPUP,
-                            0, 0, 100, 100, g_main, NULL, inst, NULL);
-    darkTitle(g_set);
-    g_setDpi = GetDpiForWindow(g_set);
-    buildSettings();
-    sizeSettingsWindow(NULL);
 
     bool startFs = false;
     if (hadIni) {
@@ -1702,8 +2311,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int) {
     }
     ShowWindow(g_main, SW_SHOW);
     if (startFs) toggleFullscreen();
-    syncControls();
-    if (!hadIni) { showSettings(true); g_dirty = true; }
+    if (!hadIni) { g_uiOpen = true; g_dirty = true; }
+    if (wchar_t v[8]; GetEnvironmentVariableW(L"ORB_OPEN_PANEL", v, 8)) g_uiOpen = true;  // used by tools/shot.ps1
 
     MSG msg;
     double lastDraw = 0, lastSave = now();
@@ -1711,15 +2320,13 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int) {
     while (running) {
         while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
             if (msg.message == WM_QUIT) { running = false; break; }
-            if (handleHotkey(msg)) continue;
-            if (IsWindowVisible(g_set) && IsDialogMessageW(g_set, &msg)) continue;
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
         if (!running) break;
 
         double t = now();
-        if (!g_cursorHidden && t - g_lastMove > 2.5 && !IsWindowVisible(g_set)) {
+        if (!g_cursorHidden && t - g_lastMove > 2.5 && !g_uiOpen) {
             g_cursorHidden = true;
             POINT pt;
             GetCursorPos(&pt);
@@ -1743,6 +2350,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int) {
 
     saveSettings();
     audioStop();
+    mediaReset();
+    urel(M.statics);
     releaseD3D();
     CoUninitialize();
     timeEndPeriod(1);
