@@ -64,6 +64,10 @@ cbuffer Orb : register(b0) {
   int uFormA; int uFormB; float uBass; float uLevel;
   float uParticles; float uCharge; float uSS; float _pad0;   // uSS = scene pixels per screen pixel
   float4 uC0, uC1, uC2, uC3;
+  float uHot; float uCore; float uShell; float uHits;   // cinematic: HDR highlights, inner core, shell clarity, bass hits
+  float4 uHitAge;    // seconds since each of the last 4 bass hits (large = none)
+  float4 uHitStr;    // their strength 0..1
+  float4 uHitSeed;   // a random number per hit (burst spark directions)
 };
 cbuffer Comp : register(b1) {
   float4 gPanel;   // clock panel centre xy, half-size xy (px)
@@ -74,11 +78,16 @@ cbuffer Comp : register(b1) {
   float4 gUi;      // settings panel rect x, y, w, h (px)
   float4 gUi2;     // settings panel corner radius, frost radius
 };
-cbuffer Post : register(b2) { float4 pTexel; float4 pParam; };
+cbuffer Post : register(b2) { float4 pTexel; float4 pParam; };   // per pass: source texel xy, zw = pass-specific
+cbuffer Fx : register(b3) {
+  float4 fA;   // light rays, lens streaks, lens dirt, film grain
+  float4 fB;   // lens fringe, bloom strength, 3D-form weight, unused
+};
 Texture2D sceneTex : register(t0);
 Texture2D textTex  : register(t1);
 Texture2D bloomTex : register(t2);
 Texture2D uiTex    : register(t3);
+Texture2D wideTex  : register(t4);   // post: a wide bloom level (lens dirt)
 SamplerState smp   : register(s0);
 
 struct VO { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
@@ -224,7 +233,9 @@ float4 orb3D(float2 p, int fa, int fb, float m) {
     I = lerp(0.6, I, uContrast);
 
     float3 L = normalize(float3(-0.25, 0.35, 0.9));
-    float lit = 0.55 + 0.5 * max(dot(n, L), 0.0);
+    float nl = max(dot(n, L), 0.0);
+    // cinematic key light: a deeper shadow side gives the form volume (uHot 0 = the original flat light)
+    float lit = lerp(0.55 + 0.5 * nl, 0.30 + 0.82 * nl, saturate(uHot) * 0.7);
     float rim = pow(max(1.0 - ndv, 0.0), 2.5);
     I = I * lit + rim * (0.2 + 0.55 * ridge);
 
@@ -253,7 +264,45 @@ float4 orb3D(float2 p, int fa, int fb, float m) {
     float3 c = shade(I);
     float aw = smoothstep(0.1, 1.0, dot(normalize(p + 1e-5), float2(0.8, -0.6))) * (0.25 + rim);
     c = lerp(c, uC3.rgb * (0.25 + 0.9 * I), saturate(aw * uAccent * 1.3));
-    col = c * edge;
+
+    // HDR: the wave crests burn white-hot (values above 1 roll to white in the tonemap and bloom hard)
+    float hot = pow(ridge, 9.0) * uHot * 1.5 * lerp(1.0, 0.35 + 1.3 * st, uGrain * 0.7) * lit;
+    c += lerp(uC2.rgb, float3(1.0, 1.0, 1.0), 0.45) * hot * uBright * (1.0 + 0.6 * uLevel);
+    // sharp fresnel rim with a faint thin-film shimmer that stays inside the palette
+    float fr = pow(max(1.0 - ndv, 0.0), 5.0);
+    float3 film = lerp(lerp(uC1.rgb, uC2.rgb, 0.5 + 0.5 * cos(ndv * 14.0 + t * 0.35)), uC3.rgb,
+                       (0.5 + 0.5 * cos(ndv * 9.0 + 2.0 - t * 0.2)) * uAccent);
+    c += film * fr * uHot * 1.3 * uBright;
+
+    // translucent shell: thinner face-on, solid at the silhouette
+    float fr2 = pow(max(1.0 - ndv, 0.0), 2.0);
+    c *= lerp(1.0, 0.5 + 0.5 * fr2, uShell);
+
+    // volumetric core: march through the inside, gathering a hot centre and slowly flowing plasma sheets
+    float3 inner = 0;
+    if (uCore > 0.001) {
+      float flare = dot(uHitStr, exp(-uHitAge * 4.0)) * uHits;
+      float3 coreC = lerp(uC2.rgb, float3(1.0, 1.0, 1.0), 0.35) * (1.0 + 0.35 * uCharge + 2.5 * flare + 0.8 * uBass);
+      float trans = 1.0, ts = 0.02;
+      [loop] for (int j = 0; j < 20; j++) {
+        float3 Pi = P + rd * ts;
+        if (map(Pi, fa, fb, m) > 0.0) break;
+        float3 qi = objSpace(Pi);
+        float core = exp(-dot(qi, qi) * 5.5);
+        float3 wq = qi * 2.2;
+        float3 wv2 = float3(noise(wq * 0.7 + float3(0.0, 0.0, t * 0.11)), noise(wq * 0.7 + float3(9.0, 4.0, -t * 0.09)), 0.0);
+        float nn = noise(wq + 1.6 * wv2 + float3(0.0, t * 0.13, 0.0));
+        float fil = pow(max(1.0 - abs(2.0 * nn - 1.0), 0.0), 9.0);
+        float3 fc3 = lerp(uC1.rgb, uC3.rgb, (0.3 + 0.4 * wv2.x) * (0.4 + 0.6 * uAccent));
+        float3 e = coreC * core * 1.6 + fc3 * fil * (1.6 + 1.2 * uLevel) * (0.3 + 0.7 * smoothstep(1.2, 0.2, length(qi)));
+        inner += e * trans * 0.09;
+        trans *= 0.93;
+        ts += 0.09;
+      }
+      inner *= uCore * uBright * (1.0 - 0.5 * fr2);
+    }
+
+    col = (c + inner) * edge;
     cov = edge;
   }
 
@@ -265,24 +314,67 @@ float4 orb3D(float2 p, int fa, int fb, float m) {
 }
 
 // sparks that peel off the surface and drift away
+// distance from p to the segment a-b
+float segDist(float2 p, float2 a, float2 b) {
+  float2 ab = b - a, ap = p - a;
+  float h = saturate(dot(ap, ab) / max(dot(ab, ab), 1e-10));
+  return length(ap - ab * h);
+}
+float2 emberPos(float tt, float R, float h1, float h2) {
+  float ang = h2 * 6.2831853 + tt * (h1 - 0.5) * 1.2;
+  float r = R * (0.92 + tt * (0.5 + 0.9 * h1));
+  return float2(cos(ang), sin(ang)) * r + float2(0.0, tt * 0.04);
+}
 float3 embers(float2 p) {
   float R = 0.5 * uSize;
   float3 c = 0;
-  [loop] for (int i = 0; i < 48; i++) {
-    float fi = (float)i;
-    float h1 = hash(float3(fi, 1.3, 7.1)), h2 = hash(float3(fi, 4.7, 2.2)), h3 = hash(float3(fi, 9.1, 5.5));
-    float life = 5.0 + 7.0 * h3;
-    float tt = frac(uTime / life + h1);
-    float ang = h2 * 6.2831853 + tt * (h1 - 0.5) * 1.2;
-    float r = R * (0.92 + tt * (0.5 + 0.9 * h1));
-    float2 pos = float2(cos(ang), sin(ang)) * r + float2(0.0, tt * 0.04);
-    float sz = R * (0.006 + 0.010 * h3);
-    float2 d = p - pos;
-    float fade = sin(tt * 3.14159);
-    fade *= fade;
-    c += exp(-dot(d, d) / (sz * sz)) * fade * (0.5 + 0.5 * h2);
+  if (uParticles > 0.001) {
+    float trail = 0.010 + 0.035 * uLevel;   // motion trail, in units of the spark's life
+    [loop] for (int i = 0; i < 48; i++) {
+      float fi = (float)i;
+      float h1 = hash(float3(fi, 1.3, 7.1)), h2 = hash(float3(fi, 4.7, 2.2)), h3 = hash(float3(fi, 9.1, 5.5));
+      float hz = hash(float3(fi, 3.3, 8.8));   // depth: a few sparks drift close to the lens, out of focus
+      float life = 5.0 + 7.0 * h3;
+      float tt = frac(uTime / life + h1);
+      float2 pos = emberPos(tt, R, h1, h2);
+      float fade = sin(tt * 3.14159);
+      fade *= fade;
+      float sz = R * (0.006 + 0.010 * h3);
+      if (hz > 0.82) {
+        // bokeh: a soft disc with a slightly brighter rim, much bigger and dimmer
+        float bs = sz * (4.0 + 5.0 * (hz - 0.82) / 0.18);
+        float d = length(p - pos);
+        float disc = smoothstep(bs, bs * 0.86, d) * (0.65 + 0.35 * smoothstep(bs * 0.45, bs * 0.95, d));
+        c += disc * fade * (0.5 + 0.5 * h2) * 0.10;
+      } else {
+        float d = segDist(p, pos, emberPos(max(tt - trail, 0.0), R, h1, h2));
+        c += exp(-d * d / (sz * sz)) * fade * (0.5 + 0.5 * h2) * (1.0 + 1.2 * uHot);
+      }
+    }
+    c *= uParticles * (1.0 + uLevel);
   }
-  return c * lerp(uC2.rgb, uC3.rgb, 0.35) * uParticles * (1.0 + uLevel);
+  // bass hits: a burst of fast sparks thrown off the surface, slowed by drag
+  float3 b = 0;
+  if (uHits > 0.001) {
+    [loop] for (int k = 0; k < 4; k++) {
+      float age = uHitAge[k];
+      if (age > 2.2 || uHitStr[k] <= 0.0) continue;
+      [loop] for (int j = 0; j < 12; j++) {
+        float fj = (float)j;
+        float g1 = hash(float3(fj, uHitSeed[k] * 97.0, 1.7)), g2 = hash(float3(fj, uHitSeed[k] * 61.0, 6.1));
+        float ang = (fj + g1) / 12.0 * 6.2831853 + uHitSeed[k] * 6.2831853;
+        float2 dir = float2(cos(ang), sin(ang));
+        float v = R * (0.5 + 0.9 * g2) * uHitStr[k];
+        float d0 = R * 0.95 + v * (1.0 - exp(-max(age - 0.05, 0.0) * 2.5));
+        float d1 = R * 0.95 + v * (1.0 - exp(-age * 2.5));
+        float d = segDist(p, dir * d0, dir * d1);
+        float sz = R * (0.008 + 0.008 * g1);
+        b += exp(-d * d / (sz * sz)) * exp(-age * 1.6) * uHitStr[k] * (1.0 + uHot);
+      }
+    }
+    b *= uHits * 1.6;
+  }
+  return (c + b) * lerp(uC2.rgb, uC3.rgb, 0.35);
 }
 
 // ------------------------------------------------ 2D forms
@@ -363,6 +455,8 @@ float3 auroraSky(float2 p, out float a) {
     float fringe = smoothstep(-0.02, -0.005, dy) * (1.0 - smoothstep(-0.004, 0.008, dy));
     c = lerp(c, uC3.rgb, fringe * 0.55 * uAccent);
     col += c * I * 1.25;
+    // HDR: the densest folds burn past white
+    col += lerp(c, uC2.rgb, 0.5) * max(I - 0.6, 0.0) * uHot * 0.8;
   }
   col *= cR;
   a = max(1.0 - cR, saturate(max(col.r, max(col.g, col.b)) * 3.0));
@@ -406,6 +500,8 @@ float4 nebula(float2 p, float2 fc) {
   float aw = smoothstep(0.0, 1.0, dot(normalize(u + 1e-5), float2(0.8, -0.6))) * smoothstep(0.3, 1.4, length(u));
   c = lerp(c, uC3.rgb * (0.2 + I), saturate(aw * uAccent));
   c += lerp(uC1.rgb, uC3.rgb, 0.4) * uGlow * 0.10 * mask * (1.0 - saturate(I));
+  // HDR: the bright filaments burn white-hot
+  c += lerp(uC2.rgb, float3(1.0, 1.0, 1.0), 0.3) * pow(rdg, 4.0) * f * mask * (1.0 - 0.7 * dust) * uHot * 0.6 * uBright;
   return float4(c, saturate(max(c.r, max(c.g, c.b)) * 3.0));
 }
 
@@ -448,29 +544,150 @@ float4 psScene(VO i) : SV_Target {
   if (wA > 0.001) r += wA * aurora(p, fc);
   if (wN > 0.001) r += wN * nebula(p, fc);
   float3 col = r.rgb + stars(fc) * (1.0 - saturate(r.a));
-  if (w3 > 0.001 && uParticles > 0.001) col += w3 * embers(p);
+  if (w3 > 0.001 && (uParticles > 0.001 || uHits > 0.001)) col += w3 * embers(p);
+  // linear HDR: tonemap, grain and dither happen in psPost
+  return float4(max(col, 0.0), 1.0);
+}
 
-  col = 1.0 - exp(-col * 1.6);
-  float lum = max(col.r, max(col.g, col.b));
+// ------------------------------------------------ HDR post: bloom mip chain, light rays, lens streaks, final grade
+float max3(float3 c) { return max(c.r, max(c.g, c.b)); }
+float3 tap0(float2 uv) { return sceneTex.SampleLevel(smp, uv, 0).rgb; }
+// the orb's centre on screen (uv, top-left origin) and the aspect ratio
+float2 orbUV() { return float2(0.5 + uOff.x * uRes.y / uRes.x, 0.5 - uOff.y); }
+
+// 13-tap downsample (pTexel.xy = source texel). pTexel.z = 1 on the first level: Karis average + soft threshold.
+float4 psDown(VO i) : SV_Target {
+  float2 t = pTexel.xy, uv = i.uv;
+  float3 a = tap0(uv + t * float2(-2, -2)), b = tap0(uv + t * float2(0, -2)), c = tap0(uv + t * float2(2, -2));
+  float3 d = tap0(uv + t * float2(-2, 0)),  e = tap0(uv),                     f = tap0(uv + t * float2(2, 0));
+  float3 g = tap0(uv + t * float2(-2, 2)),  h = tap0(uv + t * float2(0, 2)),  k = tap0(uv + t * float2(2, 2));
+  float3 j1 = tap0(uv + t * float2(-1, -1)), j2 = tap0(uv + t * float2(1, -1));
+  float3 j3 = tap0(uv + t * float2(-1, 1)),  j4 = tap0(uv + t * float2(1, 1));
+  float3 o;
+  if (pTexel.z > 0.5) {
+    // Karis average: each 2x2 group weighted by 1/(1+luma), so single hot pixels can't flicker
+    float3 g0 = (j1 + j2 + j3 + j4) * 0.25, g1 = (a + b + d + e) * 0.25, g2 = (b + c + e + f) * 0.25;
+    float3 g3 = (d + e + g + h) * 0.25, g4 = (e + f + h + k) * 0.25;
+    float w0 = 0.5 / (1.0 + max3(g0)), w1 = 0.125 / (1.0 + max3(g1)), w2 = 0.125 / (1.0 + max3(g2));
+    float w3 = 0.125 / (1.0 + max3(g3)), w4 = 0.125 / (1.0 + max3(g4));
+    o = (g0 * w0 + g1 * w1 + g2 * w2 + g3 * w3 + g4 * w4) / (w0 + w1 + w2 + w3 + w4);
+    float kk = saturate((max3(o) - 0.45) / 1.0);   // soft knee: dim light glows a little, bright light fully
+    o *= kk * kk;
+  } else {
+    o = e * 0.125 + (a + c + g + k) * 0.03125 + (b + d + f + h) * 0.0625 + (j1 + j2 + j3 + j4) * 0.125;
+  }
+  return float4(o, 1.0);
+}
+// upsample: this level (t0) + a 3x3 tent of the smaller level (t2, pTexel.xy = its texel)
+float4 psUp(VO i) : SV_Target {
+  float2 t = pTexel.xy, uv = i.uv;
+  float3 s = bloomTex.SampleLevel(smp, uv, 0).rgb * 4.0;
+  s += (bloomTex.SampleLevel(smp, uv + t * float2(0, -1), 0).rgb + bloomTex.SampleLevel(smp, uv + t * float2(0, 1), 0).rgb +
+        bloomTex.SampleLevel(smp, uv + t * float2(-1, 0), 0).rgb + bloomTex.SampleLevel(smp, uv + t * float2(1, 0), 0).rgb) * 2.0;
+  s += bloomTex.SampleLevel(smp, uv + t * float2(-1, -1), 0).rgb + bloomTex.SampleLevel(smp, uv + t * float2(1, -1), 0).rgb +
+       bloomTex.SampleLevel(smp, uv + t * float2(-1, 1), 0).rgb + bloomTex.SampleLevel(smp, uv + t * float2(1, 1), 0).rgb;
+  return float4(tap0(uv) + s / 16.0, 1.0);
+}
+// light shafts: radial blur of the bright pass towards the orb's centre
+float4 psRays(VO i) : SV_Target {
+  float2 dlt = (i.uv - orbUV()) * (0.5 / 40.0);
+  float2 uv = i.uv - dlt * hash(float3(i.pos.xy, 3.0));   // jitter hides the step banding
+  float3 acc = 0;
+  float w = 1.0;
+  [loop] for (int k = 0; k < 40; k++) {
+    float3 s = tap0(uv);
+    acc += s * saturate(max3(s) * 1.5 - 0.15) * w;   // the brightest light casts the strongest shafts
+    w *= 0.94;
+    uv -= dlt;
+  }
+  return float4(acc / 15.4, 1.0);
+}
+// anamorphic streak: wide horizontal blur, run several times with a growing step (pTexel.z); pTexel.w = 1 on the first pass
+float4 psStreak(VO i) : SV_Target {
+  float2 dx = float2(pTexel.x * pTexel.z, 0.0);
+  float3 acc = 0;
+  float ws = 0.0;
+  [unroll] for (int k = -3; k <= 3; k++) {
+    float w = exp(-abs((float)k) * 0.5);
+    float3 s = tap0(i.uv + dx * k);
+    if (pTexel.w > 0.5) { float kk = saturate((max3(s) - 1.0) / 2.0); s *= kk * kk; }   // only the hottest light streaks
+    acc += s * w;
+    ws += w;
+  }
+  return float4(acc / ws, 1.0);
+}
+
+// procedural lens dirt: soft dust discs at two sizes plus faint smudges (q in screen-height units)
+float lensDirt(float2 q) {
+  float d = 0.0;
+  [unroll] for (int l = 0; l < 2; l++) {
+    float fl = (float)l;
+    float sc = l == 0 ? 4.0 : 9.0;
+    float2 g = q * sc + fl * 7.3, id = floor(g), fr = frac(g);
+    float h = hash(float3(id, 17.0 + fl));
+    float2 pos = 0.25 + 0.5 * float2(hash(float3(id, 3.1 + fl)), hash(float3(id, 8.7 + fl)));
+    float r = 0.14 + 0.2 * hash(float3(id, 5.5 + fl));
+    float dd = length(fr - pos);
+    d += smoothstep(r, r * 0.55, dd) * (0.7 + 0.3 * smoothstep(r * 0.5, r, dd)) * step(0.5, h) * (0.3 + 0.7 * h);
+  }
+  float2 sq = rot(q, 0.6);
+  d += 0.5 * pow(noise(float3(sq.x * 1.5, sq.y * 11.0, 4.0)), 3.0) * noise(float3(q * 2.5, 9.0));
+  return d;
+}
+
+// final grade at screen resolution: t0 HDR scene, t1 light rays, t2 bloom, t3 streak, t4 wide bloom
+float4 psPost(VO i) : SV_Target {
+  float2 asp = float2(uRes.x / uRes.y, 1.0);
+  float2 oc = orbUV();
+  float2 dv = (i.uv - oc) * asp;
+  float r = length(dv);
+  float2 dir = dv / max(r, 1e-5);
+  float R = 0.5 * uSize;
+
+  // bass-hit shockwave: an expanding ring that refracts what's behind it
+  float disp = 0.0, ring = 0.0;
+  if (uHits > 0.001) {
+    [unroll] for (int k = 0; k < 4; k++) {
+      float age = uHitAge[k], s = uHitStr[k];
+      if (age < 1.6 && s > 0.0) {
+        float rad = R * 1.02 + 0.85 * (1.0 - exp(-age * 1.7)), w = 0.012 + age * 0.04;   // decelerating wavefront
+        float x = (r - rad) / w;
+        float fade = (1.0 - age / 1.6);
+        fade *= fade * s;
+        disp += x * exp(-x * x) * fade * w;
+        ring += exp(-x * x) * fade;
+      }
+    }
+    disp *= uHits;
+    ring *= uHits;
+  }
+  float2 uv = i.uv - dir / asp * disp * 0.7;
+
+  // lens fringe: red and blue split radially, growing towards the edges (none in the centre)
+  float2 cv = (uv - 0.5) * asp;
+  float2 ca = (uv - 0.5) * fB.x * 0.010 * dot(cv, cv) * 2.0;
+  float3 hdr = float3(tap0(uv + ca).r, tap0(uv).g, tap0(uv - ca).b);
+
+  hdr += max(bloomTex.SampleLevel(smp, uv, 0).rgb / 6.0 - 0.004, 0.0) * fB.y * 0.9;
+  float shaft = smoothstep(R * 0.85, R * 1.3, r);   // rays only stream outside the form
+  hdr += max(textTex.SampleLevel(smp, uv, 0).rgb - 0.004, 0.0) * fA.x * fB.z * shaft * 2.0;
+  float3 sk = max(uiTex.SampleLevel(smp, uv, 0).rgb - 0.002, 0.0);
+  hdr += lerp(sk, max3(sk) * lerp(uC1.rgb, uC3.rgb, 0.5) * 1.5, 0.6) * fA.y * 3.0;
+  hdr += max(wideTex.SampleLevel(smp, uv, 0).rgb / 3.0 - 0.006, 0.0) * lensDirt(i.uv * asp) * fA.z * 3.0;
+  hdr += ring * 0.22 * lerp(uC1.rgb, uC2.rgb, 0.6);   // the wavefront itself glows faintly
+
+  // filmic tonemap: the original per-channel curve, and very hot light also bleaches towards white
+  float3 col = 1.0 - exp(-hdr * 1.6);
+  float mx = max3(hdr);
+  col = lerp(col, (1.0 - exp(-mx * 1.6)).xxx, smoothstep(1.2, 5.0, mx) * 0.55);
+
+  // film grain (multiplied, so pure black stays pure black) + dither on lit pixels
+  float2 fc = i.pos.xy;
+  float lum = max3(col);
+  float gn = hash(float3(fc, frac(uTime * 0.37) * 311.0)) + hash(float3(fc + 17.0, frac(uTime * 0.53) * 173.0)) - 1.0;
+  col *= 1.0 + gn * fA.w * 0.22 * (1.0 - 0.6 * lum);
   col += (hash(float3(fc, frac(uTime) * 97.0)) - 0.5) / 255.0 * step(1.5 / 255.0, lum);
-  return float4(col, 1.0);
-}
-
-// ------------------------------------------------ bloom
-float4 psBright(VO i) : SV_Target {
-  float2 t = pTexel.xy;
-  float3 c = (sceneTex.SampleLevel(smp, i.uv + t * float2(-1, -1), 0).rgb + sceneTex.SampleLevel(smp, i.uv + t * float2(1, -1), 0).rgb +
-              sceneTex.SampleLevel(smp, i.uv + t * float2(-1, 1), 0).rgb + sceneTex.SampleLevel(smp, i.uv + t * float2(1, 1), 0).rgb) * 0.25;
-  float l = max(c.r, max(c.g, c.b));
-  float k = saturate((l - pParam.x) / pParam.y);
-  return float4(c * k * k, 1.0);
-}
-float4 psBlur(VO i) : SV_Target {
-  float2 d = pTexel.xy * pTexel.zw;
-  float3 c = bloomTex.SampleLevel(smp, i.uv, 0).rgb * 0.2270270270;
-  c += (bloomTex.SampleLevel(smp, i.uv + d * 1.3846153846, 0).rgb + bloomTex.SampleLevel(smp, i.uv - d * 1.3846153846, 0).rgb) * 0.3162162162;
-  c += (bloomTex.SampleLevel(smp, i.uv + d * 3.2307692308, 0).rgb + bloomTex.SampleLevel(smp, i.uv - d * 3.2307692308, 0).rgb) * 0.0702702703;
-  return float4(c, 1.0);
+  return float4(saturate(col), 1.0);
 }
 
 // ------------------------------------------------ composite: upscale + bloom + glass clock + settings panel
@@ -478,9 +695,8 @@ float sdRBox(float2 p, float2 b, float r) {
   float2 q = abs(p) - b + r;
   return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
 }
-float3 scene(float2 px) {
-  float2 uv = px / gMisc.xy;
-  return sceneTex.SampleLevel(smp, uv, 0).rgb + bloomTex.SampleLevel(smp, uv, 0).rgb * gAudio.z;
+float3 scene(float2 px) {   // the graded, display-ready frame from psPost
+  return sceneTex.SampleLevel(smp, px / gMisc.xy, 0).rgb;
 }
 float textA(float2 px) {
   float2 uv = (px - gText.xy) / gText.zw;
@@ -568,9 +784,12 @@ struct OrbCB {
     float bass, level;
     float particles, charge, ss, pad0;
     float c[4][4];
+    float hot, core, shell, hits;
+    float hitAge[4], hitStr[4], hitSeed[4];
 };
 struct CompCB { float panel[4], glass[4], text[4], misc[4], audio[4], ui[4], ui2[4]; };
 struct PostCB { float texel[4], param[4]; };
+struct FxCB { float a[4], b[4]; };
 
 // ---------------------------------------------------------------- settings
 enum {
@@ -579,6 +798,7 @@ enum {
     P_HUE, P_MORPHSEC, P_SCALE,
     P_CLOCKSIZE, P_FROST, P_REFR, P_SENS,
     P_BLOOM, P_PARTICLES,
+    P_HOT, P_CORE, P_SHELL, P_RAYS, P_STREAK, P_DIRT, P_FILMGRAIN, P_FRINGE, P_HITS,
     NP
 };
 enum { FMT_F, FMT_PCT, FMT_SEC };
@@ -605,6 +825,15 @@ static const ParamDef PD[NP] = {
     {L"sensitivity",L"Sensitivity",       0.0f, 2.0f, 1.00f, FMT_F},
     {L"bloom",      L"Bloom",             0.0f, 1.5f, 0.60f, FMT_F},
     {L"particles",  L"Drifting sparks",   0.0f, 1.0f, 0.50f, FMT_F},
+    {L"hot",        L"Hot highlights",    0.0f, 2.0f, 1.00f, FMT_F},
+    {L"core",       L"Core energy",       0.0f, 2.0f, 0.60f, FMT_F},
+    {L"shell",      L"Shell clarity",     0.0f, 1.0f, 0.45f, FMT_F},
+    {L"rays",       L"Light rays",        0.0f, 1.5f, 0.35f, FMT_F},
+    {L"streaks",    L"Lens streaks",      0.0f, 1.5f, 0.40f, FMT_F},
+    {L"dirt",       L"Lens dirt",         0.0f, 1.5f, 0.25f, FMT_F},
+    {L"filmgrain",  L"Film grain",        0.0f, 1.0f, 0.30f, FMT_F},
+    {L"fringe",     L"Lens fringe",       0.0f, 1.5f, 0.30f, FMT_F},
+    {L"hits",       L"Bass hits",         0.0f, 1.5f, 0.60f, FMT_F},
 };
 
 struct Preset { const wchar_t* name; COLORREF c[4]; };
@@ -767,7 +996,22 @@ struct AudioState {
     float rate = 48000, lp = 0, env = 0, bassEnv = 0, peak = 0.02f, bassPeak = 0.02f;
     double retryAt = 0;
     float level = 0, bass = 0;  // 0..~1 after auto-gain
+    float bassAvg = 0;          // slow average of 'bass', for onset detection
 } A;
+
+// bass hits (onsets): the last 4, for the shockwave, core flare and spark bursts
+static double g_hitT[4] = {-100, -100, -100, -100};
+static float g_hitS[4], g_hitSeed[4];
+static int g_hitIdx = 0;
+static double g_lastHit = -100;
+static bool g_fakeBeat = false;   // ORB_FAKE_BEAT env var: a synthetic hit every 2 s (screenshots/tests)
+static void addHit(double t, float strength) {
+    g_hitIdx = (g_hitIdx + 1) & 3;
+    g_hitT[g_hitIdx] = t;
+    g_hitS[g_hitIdx] = strength;
+    g_hitSeed[g_hitIdx] = (float)((rand() & 1023) / 1024.0);
+    g_lastHit = t;
+}
 
 static void audioStop() {
     if (A.client) A.client->Stop();
@@ -859,6 +1103,10 @@ static void audioUpdate(double t, float dt) {
     float bs = powf(clampf(A.bassEnv / A.bassPeak, 0, 1), 2.0f) * sens;
     A.level += (lv - A.level) * (1.f - expf(-dt * 20.f));
     A.bass += (bs - A.bass) * (1.f - expf(-dt * 25.f));
+    // onset: the bass jumps well above its recent average (with a short gap so one kick = one hit)
+    float rise = A.bass - A.bassAvg;
+    if (rise > 0.18f && A.bass > 0.35f && t - g_lastHit > 0.25) addHit(t, clampf(rise * 3.f, 0.35f, 1.f));
+    A.bassAvg += (A.bass - A.bassAvg) * (1.f - expf(-dt * 2.f));
 }
 
 // ---------------------------------------------------------------- battery
@@ -997,12 +1245,18 @@ static IDXGISwapChain1* g_sc;
 static ID3D11RenderTargetView* g_rtv;
 static int g_bbW = 0, g_bbH = 0;
 static ID3D11VertexShader* g_vs;
-static ID3D11PixelShader *g_psScene, *g_psComp, *g_psBright, *g_psBlur;
-static ID3D11Buffer *g_cbOrb, *g_cbComp, *g_cbPost;
+static ID3D11PixelShader *g_psScene, *g_psComp, *g_psDown, *g_psUp, *g_psRays, *g_psStreak, *g_psPost;
+static ID3D11Buffer *g_cbOrb, *g_cbComp, *g_cbPost, *g_cbFx;
 static ID3D11SamplerState* g_samp;
 static ID3D11RasterizerState* g_rast;
-struct Target { ID3D11Texture2D* tex = nullptr; ID3D11RenderTargetView* rtv = nullptr; ID3D11ShaderResourceView* srv = nullptr; int w = 0, h = 0; };
-static Target g_scene, g_bloomA, g_bloomB;
+struct Target {
+    ID3D11Texture2D* tex = nullptr; ID3D11RenderTargetView* rtv = nullptr; ID3D11ShaderResourceView* srv = nullptr;
+    int w = 0, h = 0;
+    DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
+};
+enum { BLOOM_LV = 6 };
+// HDR scene, bloom mip chain (down + up), light rays, streak ping-pong, and the graded frame
+static Target g_scene, g_down[BLOOM_LV], g_up[BLOOM_LV - 1], g_rays, g_strA, g_strB, g_graded;
 static ID3D11ShaderResourceView* g_textSrv;
 static std::wstring g_textKey;
 static int g_textW = 0, g_textH = 0, g_textPad = 0, g_textTh = 0;
@@ -1044,14 +1298,17 @@ static void createBackbufferView() {
 
 static void releaseTarget(Target& t) { rel(t.srv); rel(t.rtv); rel(t.tex); t.w = t.h = 0; }
 
-static void ensureTarget(Target& t, int w, int h) {
-    if (t.tex && t.w == w && t.h == h) return;
+static const DXGI_FORMAT HDR_FMT = DXGI_FORMAT_R11G11B10_FLOAT;   // 4 bytes/px like BGRA8, but floating point
+
+static void ensureTarget(Target& t, int w, int h, DXGI_FORMAT fmt = DXGI_FORMAT_B8G8R8A8_UNORM) {
+    if (t.tex && t.w == w && t.h == h && t.fmt == fmt) return;
     releaseTarget(t);
+    t.fmt = fmt;
     D3D11_TEXTURE2D_DESC td = {};
     td.Width = w;
     td.Height = h;
     td.MipLevels = td.ArraySize = 1;
-    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.Format = fmt;
     td.SampleDesc.Count = 1;
     td.Usage = D3D11_USAGE_DEFAULT;
     td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
@@ -1076,9 +1333,11 @@ static void releaseD3D() {
     rel(g_uiBmp); releaseTarget(g_ui); rel(g_br); releaseFormats();
     rel(g_d2d); RT = nullptr; rel(g_d2dDev); rel(g_d2dF); rel(g_dw);
     rel(g_textSrv);
-    releaseTarget(g_scene); releaseTarget(g_bloomA); releaseTarget(g_bloomB);
-    rel(g_rast); rel(g_samp); rel(g_cbPost); rel(g_cbComp); rel(g_cbOrb);
-    rel(g_psBlur); rel(g_psBright); rel(g_psComp); rel(g_psScene); rel(g_vs);
+    releaseTarget(g_scene); releaseTarget(g_rays); releaseTarget(g_strA); releaseTarget(g_strB); releaseTarget(g_graded);
+    for (auto& t : g_down) releaseTarget(t);
+    for (auto& t : g_up) releaseTarget(t);
+    rel(g_rast); rel(g_samp); rel(g_cbFx); rel(g_cbPost); rel(g_cbComp); rel(g_cbOrb);
+    rel(g_psPost); rel(g_psStreak); rel(g_psRays); rel(g_psUp); rel(g_psDown); rel(g_psComp); rel(g_psScene); rel(g_vs);
     rel(g_rtv); rel(g_sc); rel(g_ctx); rel(g_dev);
     g_textKey.clear();
 }
@@ -1126,9 +1385,9 @@ static bool initD3D(HWND hwnd) {
 
     // Compiled shaders are cached next to the settings (keyed by a hash of the source), so only the
     // first launch after an update pays the compile.
-    const int NS = 5;
-    const char* entries[NS] = {"vs", "psScene", "psComp", "psBright", "psBlur"};
-    const char* targets[NS] = {"vs_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0"};
+    const int NS = 8;
+    const char* entries[NS] = {"vs", "psScene", "psComp", "psDown", "psUp", "psRays", "psStreak", "psPost"};
+    const char* targets[NS] = {"vs_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0"};
     std::string blobs[NS];
     unsigned long long hsh = 1469598103934665603ull;
     for (const char* c = HLSL; *c; c++) hsh = (hsh ^ (unsigned char)*c) * 1099511628211ull;
@@ -1170,9 +1429,13 @@ static bool initD3D(HWND hwnd) {
     g_dev->CreateVertexShader(blobs[0].data(), blobs[0].size(), NULL, &g_vs);
     g_dev->CreatePixelShader(blobs[1].data(), blobs[1].size(), NULL, &g_psScene);
     g_dev->CreatePixelShader(blobs[2].data(), blobs[2].size(), NULL, &g_psComp);
-    g_dev->CreatePixelShader(blobs[3].data(), blobs[3].size(), NULL, &g_psBright);
-    g_dev->CreatePixelShader(blobs[4].data(), blobs[4].size(), NULL, &g_psBlur);
-    if (!g_vs || !g_psScene || !g_psComp || !g_psBright || !g_psBlur) { DeleteFileW(cachePath.c_str()); return false; }
+    ID3D11PixelShader** ps[NS] = {nullptr, &g_psScene, &g_psComp, &g_psDown, &g_psUp, &g_psRays, &g_psStreak, &g_psPost};
+    bool ok = g_vs != nullptr;
+    for (int i = 1; i < NS; i++) {
+        g_dev->CreatePixelShader(blobs[i].data(), blobs[i].size(), NULL, ps[i]);
+        ok = ok && *ps[i];
+    }
+    if (!ok) { DeleteFileW(cachePath.c_str()); return false; }
 
     D3D11_BUFFER_DESC bd = {};
     bd.Usage = D3D11_USAGE_DEFAULT;
@@ -1183,6 +1446,8 @@ static bool initD3D(HWND hwnd) {
     g_dev->CreateBuffer(&bd, NULL, &g_cbComp);
     bd.ByteWidth = sizeof(PostCB);
     g_dev->CreateBuffer(&bd, NULL, &g_cbPost);
+    bd.ByteWidth = sizeof(FxCB);
+    g_dev->CreateBuffer(&bd, NULL, &g_cbFx);
 
     D3D11_SAMPLER_DESC smp = {};
     smp.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
@@ -1896,11 +2161,15 @@ static void drawUi(float dt) {
     const int look[] = {P_BLOOM, P_PARTICLES, P_GLOW, P_GRAIN, P_ACCENT, P_BRIGHT, P_CONTRAST, P_STARS};
     for (int i : look) uiSlider(i);
 
-    uiSection(5, L"SOUND");
+    uiSection(5, L"CINEMATIC");
+    for (int i = P_HOT; i <= P_FRINGE; i++) uiSlider(i);
+
+    uiSection(6, L"SOUND");
     uiToggle(L"React to what's playing", &S.audio);
     uiSlider(P_SENS);
+    uiSlider(P_HITS);
 
-    uiSection(6, L"DISPLAY");
+    uiSection(7, L"DISPLAY");
     uiToggle(L"Anti burn-in drift", &S.drift);
     {
         wchar_t fb[32];
@@ -1965,11 +2234,13 @@ static void setPost(float tx, float ty, float dx, float dy) {
     PostCB p = {{tx, ty, dx, dy}, {0.32f, 0.45f, 0, 0}};
     g_ctx->UpdateSubresource(g_cbPost, 0, NULL, &p, 0, 0);
 }
-static void bindSRVs(ID3D11ShaderResourceView* a, ID3D11ShaderResourceView* b, ID3D11ShaderResourceView* c, ID3D11ShaderResourceView* d) {
-    ID3D11ShaderResourceView* nulls[4] = {};
-    g_ctx->PSSetShaderResources(0, 4, nulls);  // never leave a target bound as input
-    ID3D11ShaderResourceView* s[4] = {a, b, c, d};
-    g_ctx->PSSetShaderResources(0, 4, s);
+static void bindSRVs(ID3D11ShaderResourceView* a, ID3D11ShaderResourceView* b = nullptr, ID3D11ShaderResourceView* c = nullptr,
+                     ID3D11ShaderResourceView* d = nullptr, ID3D11ShaderResourceView* e = nullptr) {
+    ID3D11ShaderResourceView* nulls[5] = {};
+    g_ctx->OMSetRenderTargets(0, NULL, NULL);  // the last pass's target must be unbound before it can be an input
+    g_ctx->PSSetShaderResources(0, 5, nulls);  // never leave a target bound as input
+    ID3D11ShaderResourceView* s[5] = {a, b, c, d, e};
+    g_ctx->PSSetShaderResources(0, 5, s);
 }
 
 static void render() {
@@ -1990,6 +2261,7 @@ static void render() {
     updatePower(tn);
     mediaUpdate(tn);
     updateMorph(tn);
+    if (g_fakeBeat && tn - g_lastHit >= 2.0) addHit(tn, 0.9f);
     if (!g_paused) g_simT += dt * S.p[P_SPEED] * (1.0 + 1.2 * A.level);
 
     // settings panel first: Direct2D shares the device context, and everything below sets its own state
@@ -2040,7 +2312,26 @@ static void render() {
         cb.c[i][3] = 1.f;
         if (hue != 0) hueRotate(cb.c[i], hue);
     }
+    cb.hot = S.p[P_HOT];
+    cb.core = S.p[P_CORE];
+    cb.shell = S.p[P_SHELL];
+    bool hitsOn = S.audio || g_fakeBeat;
+    cb.hits = hitsOn ? S.p[P_HITS] : 0.f;
+    for (int i = 0; i < 4; i++) {
+        cb.hitAge[i] = (float)std::min(tn - g_hitT[i], 100.0);
+        cb.hitStr[i] = hitsOn ? g_hitS[i] : 0.f;
+        cb.hitSeed[i] = g_hitSeed[i];
+    }
     g_ctx->UpdateSubresource(g_cbOrb, 0, NULL, &cb, 0, 0);
+
+    // weight of the 3D forms on screen (light rays only stream from those)
+    float w3 = 0;
+    if (g_formA < NUM_3D && g_formB < NUM_3D) w3 = 1;
+    else if (g_formA < NUM_3D) w3 = 1 - g_morph;
+    else if (g_formB < NUM_3D) w3 = g_morph;
+    float bloom = S.p[P_BLOOM];
+    FxCB fx = {{S.p[P_RAYS], S.p[P_STREAK], S.p[P_DIRT], S.p[P_FILMGRAIN]}, {S.p[P_FRINGE], bloom, w3, 0}};
+    g_ctx->UpdateSubresource(g_cbFx, 0, NULL, &fx, 0, 0);
 
     g_ctx->IASetInputLayout(NULL);
     g_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
@@ -2049,33 +2340,57 @@ static void render() {
     g_ctx->OMSetDepthStencilState(NULL, 0);
     g_ctx->VSSetShader(g_vs, NULL, 0);
     g_ctx->PSSetSamplers(0, 1, &g_samp);
-    ID3D11Buffer* cbs[3] = {g_cbOrb, g_cbComp, g_cbPost};
-    g_ctx->PSSetConstantBuffers(0, 3, cbs);
+    ID3D11Buffer* cbs[4] = {g_cbOrb, g_cbComp, g_cbPost, g_cbFx};
+    g_ctx->PSSetConstantBuffers(0, 4, cbs);
 
-    // 1) scene at render resolution
-    ensureTarget(g_scene, vw, vh);
-    bindSRVs(nullptr, nullptr, nullptr, nullptr);
+    // 1) scene at render resolution, linear HDR
+    ensureTarget(g_scene, vw, vh, HDR_FMT);
+    bindSRVs(nullptr);
     fullPass(g_scene.rtv, vw, vh, g_psScene);
 
-    // 2) bloom: bright pass at 1/4 resolution, then two separable blur rounds
-    float bloom = S.p[P_BLOOM];
-    if (bloom > 0.001f) {
-        int bw = std::max(1, vw / 4), bh = std::max(1, vh / 4);
-        ensureTarget(g_bloomA, bw, bh);
-        ensureTarget(g_bloomB, bw, bh);
-        setPost(1.f / vw, 1.f / vh, 0, 0);
-        bindSRVs(g_scene.srv, nullptr, nullptr, nullptr);
-        fullPass(g_bloomA.rtv, bw, bh, g_psBright);
-        for (int it = 0; it < 2; it++) {
-            float sp = it == 0 ? 1.2f : 2.6f;
-            setPost(1.f / bw, 1.f / bh, sp, 0);
-            bindSRVs(nullptr, nullptr, g_bloomA.srv, nullptr);
-            fullPass(g_bloomB.rtv, bw, bh, g_psBlur);
-            setPost(1.f / bw, 1.f / bh, 0, sp);
-            bindSRVs(nullptr, nullptr, g_bloomB.srv, nullptr);
-            fullPass(g_bloomA.rtv, bw, bh, g_psBlur);
+    // 2) bloom mip chain: 6 downsamples from 1/2 res (the first one thresholds), then tent upsamples back up.
+    //    Always built: rays, streaks and lens dirt read it too. It's cheap (the biggest level is 1/4 of the pixels).
+    for (int i = 0; i < BLOOM_LV; i++) {
+        const Target& src = i == 0 ? g_scene : g_down[i - 1];
+        ensureTarget(g_down[i], std::max(1, vw >> (i + 1)), std::max(1, vh >> (i + 1)), HDR_FMT);
+        setPost(1.f / src.w, 1.f / src.h, i == 0 ? 1.f : 0.f, 0);
+        bindSRVs(src.srv);
+        fullPass(g_down[i].rtv, g_down[i].w, g_down[i].h, g_psDown);
+    }
+    for (int i = BLOOM_LV - 2; i >= 0; i--) {
+        const Target& lower = i == BLOOM_LV - 2 ? g_down[BLOOM_LV - 1] : g_up[i + 1];
+        ensureTarget(g_up[i], g_down[i].w, g_down[i].h, HDR_FMT);
+        setPost(1.f / lower.w, 1.f / lower.h, 0, 0);
+        bindSRVs(g_down[i].srv, nullptr, lower.srv);
+        fullPass(g_up[i].rtv, g_up[i].w, g_up[i].h, g_psUp);
+    }
+
+    // 3) light rays (radial blur towards the orb) and the anamorphic streak, both at 1/4 res
+    const Target& q = g_down[1];
+    bool rays = S.p[P_RAYS] > 0.001f && w3 > 0.001f, streak = S.p[P_STREAK] > 0.001f;
+    if (rays) {
+        ensureTarget(g_rays, q.w, q.h, HDR_FMT);
+        setPost(1.f / q.w, 1.f / q.h, 0, 0);
+        bindSRVs(q.srv);
+        fullPass(g_rays.rtv, q.w, q.h, g_psRays);
+    }
+    if (streak) {
+        ensureTarget(g_strA, q.w, q.h, HDR_FMT);
+        ensureTarget(g_strB, q.w, q.h, HDR_FMT);
+        const float steps[4] = {1, 4, 16, 64};
+        for (int k = 0; k < 4; k++) {
+            const Target& src = k == 0 ? q : ((k & 1) ? g_strA : g_strB);
+            Target& dst = (k & 1) ? g_strB : g_strA;
+            setPost(1.f / q.w, 1.f / q.h, steps[k], k == 0 ? 1.f : 0.f);
+            bindSRVs(src.srv);
+            fullPass(dst.rtv, q.w, q.h, g_psStreak);
         }
     }
+
+    // 4) final grade at screen resolution: shockwave, fringe, bloom + rays + streak + dirt, tonemap, grain
+    ensureTarget(g_graded, g_bbW, g_bbH);
+    bindSRVs(g_scene.srv, rays ? g_rays.srv : nullptr, g_up[0].srv, streak ? g_strB.srv : nullptr, g_up[3].srv);
+    fullPass(g_graded.rtv, g_bbW, g_bbH, g_psPost);
 
     // 3) composite at full resolution
     CompCB cc = {};
@@ -2118,8 +2433,7 @@ static void render() {
         cc.text[3] = (float)g_textH;
     }
     g_ctx->UpdateSubresource(g_cbComp, 0, NULL, &cc, 0, 0);
-    bindSRVs(g_scene.srv, S.clockStyle > 0 ? g_textSrv : nullptr, bloom > 0.001f ? g_bloomA.srv : nullptr,
-             cc.audio[3] > 0 ? g_ui.srv : nullptr);
+    bindSRVs(g_graded.srv, S.clockStyle > 0 ? g_textSrv : nullptr, nullptr, cc.audio[3] > 0 ? g_ui.srv : nullptr);
     fullPass(g_rtv, g_bbW, g_bbH, g_psComp);
 
     HRESULT hr = g_sc->Present(1, 0);
@@ -2138,6 +2452,8 @@ static void render() {
         swprintf(b, 160, L"%d fps  ·  %d×%d%ls%ls", g_frames, vw, vh, g_paused ? L"  ·  paused" : L"",
                  S.audio ? (A.client ? L"  ·  listening" : L"  ·  no audio device") : L"");
         g_statText = b;
+        static bool statTitle = GetEnvironmentVariableW(L"ORB_STAT_TITLE", NULL, 0) > 0;   // tests read fps from the title
+        if (statTitle) SetWindowTextW(g_main, b);
         g_frames = 0;
         g_fpsT = tn;
     }
@@ -2313,6 +2629,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int) {
     if (startFs) toggleFullscreen();
     if (!hadIni) { g_uiOpen = true; g_dirty = true; }
     if (wchar_t v[8]; GetEnvironmentVariableW(L"ORB_OPEN_PANEL", v, 8)) g_uiOpen = true;  // used by tools/shot.ps1
+    if (wchar_t v[8]; GetEnvironmentVariableW(L"ORB_FAKE_BEAT", v, 8)) g_fakeBeat = true;  // a bass hit every 2 s
 
     MSG msg;
     double lastDraw = 0, lastSave = now();

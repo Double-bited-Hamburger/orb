@@ -58,6 +58,7 @@ $out = Join-Path $dir "$Name.png"
 $bmp.Save($out)
 $p.Refresh()
 "{0}: window-up {1:N1}s, private {2:N0} MB -> {3}" -f $Name, $startup, ($p.PrivateMemorySize64 / 1MB), $out
+if ($env:ORB_STAT_TITLE) { "   title: $($p.MainWindowTitle)" }   # Orb puts its fps line in the title when ORB_STAT_TITLE is set
 $p.CloseMainWindow() | Out-Null
 Start-Sleep -Milliseconds 800
 if (-not $p.HasExited) { Stop-Process $p }

@@ -36,25 +36,40 @@ cmd /c "native\build.bat OrbTest.exe"   # build beside it while the user's Orb.e
 
 ## Architecture (`orb.cpp`)
 
-**Rendering per frame, D3D11, flip-model swap chain, vsync.**
+**Rendering per frame, D3D11, flip-model swap chain, vsync.** Since v0.3 the scene is **linear HDR**; the tonemap happens late.
 0. If the settings panel is visible, Direct2D draws it into its own texture (`drawUi`).
-1. `psScene` renders the scene into an offscreen texture at **render scale × AA factor**.
+1. `psScene` renders the scene into `g_scene` (**`R11G11B10_FLOAT`**, `HDR_FMT`) at **render scale × AA factor**. No tonemap, no dither.
    - Render scale is the `Render resolution` slider.
    - The AA factor is `S.aa`: Off / 1.5× / 2× supersampling, ini key `aa`, default 1.5×.
-   - The composite's bilinear fetch averages the bigger scene back down.
+   - `psPost`'s bilinear fetch averages the bigger scene back down.
    - `uSS` (scene px per screen px) keeps grain and stipple sizes in screen pixels, so they look the same at any AA level.
    - Silhouettes (mountains, trees, waterline) also get analytic 1-px anti-aliasing via `smoothstep(±1.2/uRes.y)`.
-2. Bloom (if > 0): `psBright` downsamples to 1/4 res with a soft threshold. Then `psBlur` (9-tap linear Gaussian) runs H+V, twice.
-3. `psComp` draws at full resolution, in this order:
-   - scene + bloom;
+2. Bloom mip chain (always built; rays, streaks and dirt read it too):
+   - `psDown` ×6 into `g_down[0..5]` (1/2 … 1/64 res). It's a 13-tap filter; the first level also does a Karis average (no firefly flicker) and a soft knee (0.45 → 1.45).
+   - `psUp` ×5 into `g_up[4..0]`: each level + a 3×3 tent of the smaller one. `g_up[0]/6` is the bloom.
+3. At 1/4 res (`g_down[1]`'s size):
+   - `psRays` (if `Light rays` > 0 and a 3D form is showing): a 40-tap radial blur towards the orb's screen centre (`orbUV()`), into `g_rays`.
+   - `psStreak` (if `Lens streaks` > 0): 4 horizontal passes, step 1/4/16/64, ping-ponging `g_strA`/`g_strB`; the first pass keeps only very hot light.
+4. `psPost` writes the display-ready frame to `g_graded` (BGRA8, screen res). In order:
+   - the bass-hit shockwave (refracts the sample position);
+   - lens fringe (radial R/B split, zero in the centre);
+   - scene + bloom + rays (only outside the form) + streak (tinted) + lens dirt (procedural `lensDirt` × wide bloom `g_up[3]`) + the shockwave's faint glow;
+   - tonemap: the original per-channel `1-exp(-c·1.6)`, plus very hot light (max > 1.2) bleaches towards white;
+   - film grain (multiplicative, so black stays 0) and the 1/255 dither on lit pixels.
+
+   All effects subtract a small floor (`- 0.004` etc.), so far-field black stays exactly 0.
+5. `psComp` draws at full resolution, in this order:
+   - the graded frame (`scene()` is now a plain fetch of `g_graded`);
    - the glass clock;
    - the clock text;
    - the settings panel on a dark glass sheet.
 
-   Both glass panels use the same `glassOver` function.
+   Both glass panels use the same `glassOver` function. They sample the graded (LDR) frame, so the glass looks the same as before.
 - Fullscreen quad from `SV_VertexID` (no vertex buffers).
-- Constant buffers: `Orb` (b0), `Comp` (b1), `Post` (b2). The C++ structs `OrbCB`, `CompCB` and `PostCB` must match the HLSL layout exactly (16-byte rows).
-- Textures: t0 scene, t1 clock text, t2 bloom, t3 UI.
+- Constant buffers: `Orb` (b0), `Comp` (b1), `Post` (b2, per-pass texel/step), `Fx` (b3: rays, streaks, dirt, grain, fringe, bloom, 3D weight). The C++ structs `OrbCB`, `CompCB`, `PostCB` and `FxCB` must match the HLSL layout exactly (16-byte rows). All 4 are bound for every pass, so post shaders can read `uOff`, `uSize`, `uC*`, `uHit*`.
+- Textures: t0 scene, t1 clock text, t2 bloom, t3 UI, t4 wide bloom. The post passes reuse the slots: in `psPost`, t1 = rays, t3 = streak.
+- `bindSRVs` unbinds the render target first, because D3D silently nulls an SRV that's still bound as output.
+- `ensureTarget(t, w, h, fmt)` recreates when the size **or format** changes. `g_ui` must stay BGRA8 (Direct2D).
 - `psScene`'s `fc` is `gl_FragCoord`-style (bottom-left origin); `p` is in screen-height units, centred, minus the drift offset.
 
 **Forms** (`S.form`, keys 1–7): 0 Orb, 1 Blob, 2 Ring, 3 Cube, 4 Crystal, 5 Aurora, 6 Nebula.
@@ -64,6 +79,12 @@ cmd /c "native\build.bat OrbTest.exe"   # build beside it while the user's Orb.e
   - soft round dots, ~3 screen px;
   - two rotated lattices with random gaps;
   - a single regular lattice showed a visible woven grid, and the old hard square cells looked pixelated. Edges fade by `n·v` (the fuzzy silhouette).
+- **Cinematic (v0.3)**, all in `orb3D`:
+  - **Hot crests** (`uHot`, `Hot highlights`): `pow(ridge, 9)` adds HDR light (> 1) towards white, so the crests burn and bloom. It also deepens the shadow side of the key light. `uHot = 0` gives exactly the v0.2 surface.
+  - **Fresnel rim:** `pow(1-ndv, 5)` with a thin-film shimmer cycling through the palette colours (never outside them).
+  - **Translucent shell** (`uShell`, `Shell clarity`): the shell emission is thinner face-on.
+  - **Volumetric core** (`uCore`, `Core energy`): after the hit, a `[loop]` of 20 steps (0.09 each) marches *inside* until `map() > 0`. It gathers a hot centre `exp(-r²·5.5)` and plasma sheets `pow(1-|2·noise-1|, 9)` (domain-warped, in object space), with absorption 0.93 per step. It flares on bass hits.
+  - Aurora's dense folds and Nebula's filaments get a smaller HDR boost.
 - 3D→3D switches are a **true SDF morph** (`lerp` of distances). Anything involving Aurora/Nebula **cross-fades**.
 - **Aurora** (`aurora` / `auroraSky`):
   - Far mountain range from ridged noise (`ridge`). It's nearly black, but the snowy upper slopes catch a little aurora light.
@@ -73,6 +94,8 @@ cmd /c "native\build.bat OrbTest.exe"   # build beside it while the user's Orb.e
   - Below `water`, a lake mirrors a stretched copy of the sky, with ripples.
 - **Nebula:** domain-warped fbm with dark dust lanes (a second fbm, subtracted).
 - **Embers:** 48 hashed sparks drift off the 3D forms (`uParticles`, the `Drifting sparks` slider).
+  - Each spark has a hashed depth. ~18% are near the lens: big, dim **bokeh** discs with a brighter rim. The rest are **capsules** along their path (`segDist` between `emberPos(tt)` and `emberPos(tt - trail)`), and the trail grows with the volume.
+  - **Bass hits** add 12 burst sparks per hit, thrown radially and slowed by drag.
 - Morph state lives in C++: `g_formA`, `g_formB`, `g_morph`, `setForm(f, seconds)`. Auto-morph cycles through forms 0–4.
 
 **Shader compile-time pitfalls** (fxc via `d3dcompiler_47.dll`). The first 3D version hung for over 20 s:
@@ -96,6 +119,7 @@ cmd /c "native\build.bat OrbTest.exe"   # build beside it while the user's Orb.e
 **Audio** (`audioUpdate`): WASAPI **loopback** of the default output device, polled once per frame (no thread).
 - It computes RMS plus a ~120 Hz low-passed bass level, with attack/release envelopes and an **auto-gain** that follows the recent peak.
 - Outputs `A.level` and `A.bass` (0..~1 × Sensitivity). These drive: size pulse, faster ripples (`simT`), brightness, halo and wobble.
+- **Bass hits (onsets):** when `A.bass` jumps > 0.18 above its ~0.5 s average (`A.bassAvg`) and is > 0.35, with a 250 ms gap, `addHit` stores it in a 4-slot ring (`g_hitT/S/Seed`). The ages, strengths and seeds go to `OrbCB` (`uHitAge/Str/Seed`). They drive the decelerating shockwave in `psPost`, the core flare and the burst sparks. The `Bass hits` slider (`uHits`) is 0 unless sound is on.
 - It reconnects after device changes. Nothing is stored.
 
 **Battery:** `GetSystemPowerStatus` every 5 s (`g_batPct`, `g_charging`). While charging, the orb's halo breathes (`uCharge`).
@@ -140,6 +164,11 @@ cmd /c "native\build.bat OrbTest.exe"   # build beside it while the user's Orb.e
   - double-click outside: fullscreen;
   - right-click: toggles the panel.
 - The `ORB_OPEN_PANEL` env var opens the panel at startup (for tests).
+- Sections: Form, Colours, Clock, Shape & motion, Look, **Cinematic** (`P_HOT`…`P_FRINGE`), Sound (+ `Bass hits`), Display.
+
+**Test hooks (env vars):**
+- `ORB_FAKE_BEAT`: a synthetic bass hit every 2 s, even with sound off.
+- `ORB_STAT_TITLE`: the fps line goes into the window title; `shot.ps1` prints it.
 
 ## Controls
 
@@ -160,6 +189,11 @@ cmd /c "native\build.bat OrbTest.exe"   # build beside it while the user's Orb.e
 - **GPU choice:** the laptop has an AMD Radeon 780M iGPU and an RTX 5060. Forcing the iGPU (`DXGI_GPU_PREFERENCE_MINIMUM_POWER`) loaded **both** drivers (92 MB). We use the default adapter, and the user can choose a GPU per app in Windows Settings → Display → Graphics.
 - **Wide format strings:** with MinGW UCRT, `swprintf` needs `%ls` for `wchar_t*`. `%s` printed only the first character.
 - **Measured CPU use:** ~4–7% of one core at 60 fps.
+- **v0.3 cost** (measured 2026-11-16, default adapter):
+  - Speed: 61 fps at 3726×2041 scene (≈1440p window, 1.5× SSAA) with `Core energy` 1.0.
+  - Memory: private memory in `shot.ps1`'s 1280×760 window went from 70 MB (v0.2) to ~84–88 MB, from the HDR mip chain + graded target. ~134 MB at the 2500×1400 window.
+  - psScene first compile: ~3.6 s.
+- **HDR format:** `R11G11B10_FLOAT` is 4 bytes/px (same as BGRA8). No alpha is needed: the scene's alpha was never read.
 
 ## Testing
 
@@ -185,7 +219,9 @@ Checked so far:
 **Don't publish screenshots that show the now-playing line:** it reveals what the user is listening to. Use `media=0` for README shots.
 
 Not yet checked:
-- How the sound reaction looks while audio is actually playing.
+- How the sound reaction looks while audio is actually playing. For v0.3: the bass-hit onset thresholds with real music (only checked with `ORB_FAKE_BEAT`).
+- v0.3 fps on the Radeon 780M iGPU specifically (only the default adapter was measured).
+- The Orb → Aurora/Nebula cross-fade with the v0.3 post effects. The ray weight follows the same `w3` as the shader, but it wasn't seen.
 - Fullscreen on the second monitor.
 
 ## GitHub & releases
@@ -195,6 +231,7 @@ Not yet checked:
 - Released versions:
   - **v0.1.5**: first public release. 7 forms + morphing, liquid-glass clock, sound reactivity, stars, color cycle.
   - **v0.2.0**: Direct2D settings panel, realistic aurora, bloom, sparks, battery, now playing, SSAA, round-dot stipple, nebula dust.
+  - **v0.3.0** (built, not released yet): cinematic look. HDR pipeline + filmic tonemap, mip-chain bloom, hot crests, translucent shell with volumetric core, fresnel rim, light rays, anamorphic streaks, lens dirt, fringe, film grain, bokeh and trailing sparks, bass-hit shockwaves.
 - README screenshots: `shot.ps1` with `drift=0 media=0 battery=0`, cropped to the 1264×720 client area (x 8, y 32). For the panel shot, set `ORB_OPEN_PANEL=1`; `-Settings`'s SendKeys didn't reach the window.
 
 ## Ideas not done yet

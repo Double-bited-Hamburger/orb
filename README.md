@@ -29,8 +29,9 @@ Windows SmartScreen may ask for confirmation the first time: choose *More info �
 - **Liquid-glass clock**: a frosted panel that refracts and bends what's behind it, with a chromatic rim, sheen and shadow, and it pulses with the bass. Choose Glass, Minimal (text only) or Off. 7 positions, 12/24-hour time, optional seconds and date, adjustable size, frost and refraction.
 - **Battery and now playing**: the clock can show the battery level and charging state, plus the title and artist of what's playing (any app that uses Windows media controls, such as Spotify or a browser).
 - **Animated settings panel**: a dark liquid-glass sheet slides in from the right, with eased sliders, toggles, a segmented control, form icons and gradient palette swatches.
-- **Bloom and drifting sparks** around the 3D forms.
-- **Reacts to sound**: it listens to whatever the PC is playing (music, videos), and the orb pulses with the bass and ripples faster with the volume. Auto-gain plus a sensitivity slider. Nothing is recorded.
+- **Cinematic look**: rendered in HDR, so the wave crests burn white-hot and bloom like real light through a layered, wide glow. The shell is translucent, with a glowing core and slowly flowing plasma visible inside, and a sharp fresnel rim. Light rays stream from the orb, with anamorphic lens streaks, lens-dirt glints, edge fringing, film grain and out-of-focus bokeh sparks. Every effect has its own slider, and black stays pure black.
+- **Bloom and drifting sparks** around the 3D forms. The sparks leave motion trails.
+- **Reacts to sound**: it listens to whatever the PC is playing (music, videos), and the orb pulses with the bass and ripples faster with the volume. Strong bass hits send a shockwave rippling outward, flare the core and throw off a burst of sparks. Auto-gain plus a sensitivity slider. Nothing is recorded.
 - **Looks**: 6 palette presets plus 4 custom colours, color cycling, twinkling stars, particle grain, glow, contrast and more.
 - **Screen-friendly**: anti burn-in drift slowly moves the orb and clock. Pure-black background. FPS cap and render resolution for lighter use.
 - **Anti-aliasing**: 1.5× or 2× supersampling for smooth edges and grain.
